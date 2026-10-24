@@ -31,7 +31,8 @@ def test_templates_expose_inputs_and_what_is_not_built(s):
     assert {"lighting_from_dialux", "load_and_max_demand", "full_project"} <= set(t)
     assert t["cable_and_protection"]["not_built"]  # honest about gaps
     assert {w["kind"] for w in s.plan_templates()["workbooks"]} == {
-        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs"}
+        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs",
+        "placement_table"}
 
 
 def test_define_requires_goal_criteria_and_is_not_overwritten(s):
@@ -41,7 +42,7 @@ def test_define_requires_goal_criteria_and_is_not_overwritten(s):
         s.plan_define("demo", "t", "g", ["c"], template="nope")
     out = define_lighting(s)
     assert out["status"] == "draft" and out["approved"] is False
-    assert out["progress"] == {"done": 0, "total": 9}
+    assert out["progress"] == {"done": 0, "total": 12}
     with pytest.raises(ValueError, match="already exists"):
         define_lighting(s)
     assert s.plan_define("demo", "t", "g", ["c"], replace=True)["title"] == "t"
@@ -60,22 +61,28 @@ def test_plan_asks_the_user_for_exactly_what_is_missing(s):
 def test_steps_wait_for_approval_inputs_and_dependencies(s):
     define_lighting(s)
     with pytest.raises(ValueError, match="not approved"):
-        s.plan_update_step("demo", "s2", "in_progress")
+        s.plan_update_step("demo", "s0a", "in_progress")
     with pytest.raises(ValueError, match="user_confirmed"):
         s.plan_approve("demo", user_confirmed=False)
     s.plan_approve("demo", user_confirmed=True, note="ok by user")
+    s.plan_update_step("demo", "s0a", "done", result="12 files, 7 floors")  # no inputs needed
     with pytest.raises(ValueError, match="blocked"):
-        s.plan_update_step("demo", "s2", "in_progress")  # dialux_export missing
+        s.plan_update_step("demo", "s0b", "in_progress")  # arch_dxf missing
+    s.plan_provide_input("demo", "arch_dxf", "C:/x/base.dxf")
+    s.plan_update_step("demo", "s0b", "done", result="working copy made")
+    with pytest.raises(ValueError, match="blocked"):
+        s.plan_update_step("demo", "s0c", "in_progress")  # dialux_export missing
     s.plan_provide_input("demo", "dialux_export", "C:/x/floor4.dxf")
+    s.plan_update_step("demo", "s0c", "done", result="erased DLX layers, scaled x1000")
     s.plan_update_step("demo", "s2", "in_progress")
     with pytest.raises(ValueError, match="result"):
         s.plan_update_step("demo", "s2", "done")
     out = s.plan_update_step("demo", "s2", "done", result="3 blocks, 68 luminaires")
-    assert out["progress"]["done"] == 1
+    assert out["progress"]["done"] == 4
     with pytest.raises(ValueError, match="blocked"):
         s.plan_update_step("demo", "s3", "done", result="x")  # alignment points still missing
     s.plan_provide_input("demo", "alignment_points", "A(0,0)->(0,0); B(6,0)->(6000,0)")
-    assert s.plan_update_step("demo", "s3", "done", result="residual 0")["progress"]["done"] == 2
+    assert s.plan_update_step("demo", "s3", "done", result="residual 0")["progress"]["done"] == 5
     forced = s.plan_update_step("demo", "s9", "done", result="skipped check", note="user override",
                                 force=True)
     assert next(x for x in forced["steps"] if x["id"] == "s9")["status"] == "done"
@@ -233,13 +240,13 @@ def test_strict_mode_blocks_changes_until_goal_is_approved(s, monkeypatch, tmp_p
     monkeypatch.setattr(server.CFG, "require_plan", True)
     app = App()
     monkeypatch.setattr(server, "_LIVE", LiveSession(PlainCom(app), tmp_path / "st"))
-    with pytest.raises(ValueError, match="requires an approved plan"):
+    with pytest.raises(ValueError, match="no approved plan"):
         s.live_place("4F", "socket", 10, 10)
-    with pytest.raises(ValueError, match="requires an approved plan"):
+    with pytest.raises(ValueError, match="no approved plan"):
         s.apply_changes("demo", "4F", "cs-x")
     assert s.live_connect()["drawing"] == "Drawing1.dwg"  # reading is always allowed
     s.plan_define("demo", "Sockets", "Place sockets", ["placed"])
-    with pytest.raises(ValueError, match="requires an approved plan"):
+    with pytest.raises(ValueError, match="no approved plan"):
         s.live_place("4F", "socket", 10, 10)  # defined but not approved
     s.plan_approve("demo", user_confirmed=True)
     assert s.live_place("4F", "socket", 10, 10)["created"]
@@ -252,6 +259,6 @@ def test_dry_run_import_is_allowed_in_strict_mode(s, monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_LIVE", LiveSession(PlainCom(App()), tmp_path / "st"))
     export = make_export(str(tmp_path / "d.dxf"))
     assert s.live_import_luminaires("4F", export, block_names=["LUM_A"])["dry_run"]
-    with pytest.raises(ValueError, match="requires an approved plan"):
+    with pytest.raises(ValueError, match="no approved plan"):
         s.live_import_luminaires("4F", export, block_names=["LUM_A"], dry_run=False)
     monkeypatch.setattr(server.CFG, "require_plan", False)

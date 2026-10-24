@@ -119,6 +119,8 @@ class LiveSession:
         self.state_dir = state_dir
         self.mode = "plan"  # "plan" = plan-level symbols, "schematic" = AutoCAD Electrical schematic
         self._depth = 0  # nesting of _op(): only the outermost opens/closes the undo mark
+        self.is_protected = lambda path: False  # set by the server: registered base drawings
+        self.oplog = None  # set by the server: callable(dict) recording what was done
 
     # ------------------------------------------------------------------ plumbing
     @property
@@ -160,6 +162,12 @@ class LiveSession:
         def __enter__(self):
             self.doc = self.live.doc
             if self.live._depth == 0:
+                full = str(self.live.com.call(lambda: self.doc.FullName))
+                if self.live.is_protected(full):
+                    raise ValueError(
+                        f"{Path(full).name} is a registered BASE drawing and is never written to. "
+                        "Make a working copy first (floor_from_base, then open the copy), or "
+                        "SaveAs a new name in AutoCAD.")
                 self.live.com.call(lambda: self.doc.StartUndoMark())
             self.live._depth += 1
             return self
@@ -172,6 +180,62 @@ class LiveSession:
 
     def _op(self) -> LiveSession._Op:
         return LiveSession._Op(self)
+
+    def _record(self, op: str, **detail: Any) -> None:
+        if self.oplog is not None:
+            try:
+                self.oplog({"op": op, "drawing": self._doc_name(), **detail})
+            except Exception:  # noqa: BLE001 - logging must never break a drawing operation
+                pass
+
+    def _doc_name(self) -> str:
+        try:
+            return str(self.com.call(lambda: self.doc.Name))
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def lisp(self, expr: str, timeout: float = 20.0) -> str:
+        """Evaluate an AutoLISP expression in the active drawing; returns its printed value.
+        The answer comes back through the USERS1 system variable in chunks (SendCommand returns
+        nothing). AutoCAD must be idle."""
+        from .backends.base import BackendError
+
+        c = self.com.call
+        doc = self.doc
+        chunk, limit = 440, 30000
+
+        def run(cmd: str) -> str:
+            c(lambda: doc.SetVariable("USERS1", ""))
+            c(lambda: doc.SendCommand(cmd + "\n"))
+            end = time.time() + timeout
+            while time.time() < end:
+                val = str(c(lambda: doc.GetVariable("USERS1")))
+                if val:
+                    return val
+                time.sleep(0.15)
+            raise BackendError(
+                "AutoCAD did not answer the AutoLISP request in time. It may be busy or inside "
+                "a command/dialog: press Esc in AutoCAD and try again.")
+
+        first = run(
+            '(progn (setq *acm-r* (vl-catch-all-apply (quote (lambda () (vl-princ-to-string '
+            + expr + '))))) (if (vl-catch-all-error-p *acm-r*) (setq *acm-r* (strcat "LISP ERROR: "'
+            ' (vl-catch-all-error-message *acm-r*)))) '
+            f'(setvar "USERS1" (strcat "OK:" (substr *acm-r* 1 {chunk}))) (princ))')
+        out = first.removeprefix("OK:")
+        pos = chunk + 1
+        while len(out) == pos - 1 and len(out) < limit:
+            nxt = run(f'(progn (setvar "USERS1" (strcat "OK:" (substr *acm-r* {pos} {chunk}))) '
+                      '(princ))').removeprefix("OK:")
+            if not nxt:
+                break
+            out += nxt
+            pos += chunk
+            if len(nxt) < chunk:
+                break
+        if out.startswith("LISP ERROR"):
+            raise BackendError(out)
+        return out
 
     def _groups(self) -> dict[str, Any]:
         doc = self.doc
@@ -237,6 +301,7 @@ class LiveSession:
             "unit_scale_vs_mm": self._scale(),
             "modelspace_entities": total, "entities_per_layer": layers,
             "tracked_devices": len(data["devices"]), "tracked_routes": len(data["routes"]),
+            "active_drawing_is_protected_base": bool(self.is_protected(str(c(lambda: doc.FullName)))),
             "note": "unit_scale_vs_mm is derived from geometry (1 = millimetre drawing); "
                     "the INSUNITS header is not trusted.",
         }
@@ -394,6 +459,8 @@ class LiveSession:
         res = self._place_core(floor, dtype, x, y, rotation, circuit, db, room, device_id,
                                tolerance, extra, data, self._groups(), self._scale(), {})
         self._save(data)
+        if res["created"]:
+            self._record("place", id=res["id"], type=dtype, x=x, y=y)
         return res
 
     def _place_core(self, floor, dtype, x, y, rotation, circuit, db, room, device_id, tolerance,
@@ -444,6 +511,7 @@ class LiveSession:
                         skipped += 1
         finally:
             self._save(data)  # keep the registry in step with whatever was drawn
+            self._record("place_many", floor=floor, created=created, already_present=skipped)
         return {"created": created, "already_present": skipped, "ids": ids[:200],
                 "undo": "one live_undo reverts the whole import"}
 
@@ -477,6 +545,7 @@ class LiveSession:
         for cid in stale:
             data["routes"][cid]["stale"] = True
         self._save(data)
+        self._record("move", id=meta["id"], x=round(nx, 2), y=round(ny, 2))
         return {"id": meta["id"], "x": round(nx, 2), "y": round(ny, 2),
                 "routes_now_stale": stale,
                 "note": "re-run live_route for stale circuits" if stale else None}
@@ -496,6 +565,7 @@ class LiveSession:
         for cid in stale:
             data["routes"][cid]["stale"] = True
         self._save(data)
+        self._record("delete", id=meta["id"])
         return {"deleted": meta["id"], "routes_now_stale": stale}
 
     def assign(self, device_id: str, circuit: str, db: str | None = None) -> dict[str, Any]:
@@ -561,12 +631,15 @@ class LiveSession:
                 c(lambda: setattr(t, "Layer", layer))
                 ents.append(t)
             self._make_group(gid, ents)
-        data["routes"][circuit] = {"circuit": circuit, "kind": kind, "db": db,
-                                   "device_ids": order, "stale": False}
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:], strict=False))
+        data["routes"][circuit] = {"circuit": circuit, "kind": kind, "db": db, "device_ids": order,
+                                   "stale": False, "length_units": round(length, 3)}
         for did in order:
             data["devices"][did].update(circuit=circuit, db=db)
         self._save(data)
-        return {"route": gid, "layer": layer, "from": db, "devices": order, "points": len(pts)}
+        self._record("route", circuit=circuit, devices=len(order), length_units=round(length, 1))
+        return {"route": gid, "layer": layer, "from": db, "devices": order, "points": len(pts),
+                "length_units": round(length, 1)}
 
     @staticmethod
     def _l(a, b):
@@ -596,6 +669,7 @@ class LiveSession:
         counts: dict[str, int] = {}
         for m in made:
             counts[m["type"]] = counts.get(m["type"], 0) + 1
+        self._record("adopt", floor=floor, count=len(made))
         return {"adopted": len(made), "by_type": counts, "devices": made[:200]}
 
     def add_text(self, layer: str, text: str, x: float, y: float, height: float) -> dict[str, Any]:
@@ -633,11 +707,153 @@ class LiveSession:
 
     def save(self, path: str | None = None) -> dict[str, Any]:
         doc = self.doc
+        target = str(Path(path).resolve()) if path else str(self.com.call(lambda: doc.FullName))
+        if self.is_protected(target) or (not path and self.is_protected(
+                str(self.com.call(lambda: doc.FullName)))):
+            raise ValueError(f"{Path(target).name} is a registered BASE drawing: it is never saved over. "
+                             "Use a new name (live_save with a path) or a working copy.")
         if path:
-            self.com.call(lambda: doc.SaveAs(str(Path(path).resolve())))
+            self.com.call(lambda: doc.SaveAs(target))
         else:
             self.com.call(lambda: doc.Save())
+        self._record("save", path=target)
         return {"saved": str(self.com.call(lambda: doc.FullName))}
+
+    # ------------------------------------------------------------------ inventory / sanitize
+    @staticmethod
+    def _lisp_name(n: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9_$.\- ]{1,80}", n))
+
+    def inventory(self, top_layers: int = 6) -> dict[str, Any]:
+        """Fast census of a (possibly huge) open drawing: entities per layer and per type on the
+        biggest layers, block definitions, units and extents. Counts come from AutoCAD itself
+        (selection sets), not by walking every object over COM, so an 88,000-mesh DIALux export is OK."""
+        c, doc = self.com.call, self.doc
+        layer_names = [str(c(lambda lyr=lyr: lyr.Name)) for lyr in c(lambda: doc.Layers)]
+        ok = [n for n in layer_names if self._lisp_name(n)]
+        lst = " ".join(f'"{n}"' for n in ok)
+        raw = self.lisp('(apply (quote strcat) (mapcar (quote (lambda (l) (strcat l "=" (itoa (if (setq s '
+                        '(ssget "X" (list (cons 8 l)))) (sslength s) 0)) ";"))) (quote (' + lst + '))))')
+        counts = {k: int(v) for k, v in (kv.split("=", 1) for kv in raw.split(";") if "=" in kv)}
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        types = ["LINE", "LWPOLYLINE", "POLYLINE", "INSERT", "MESH", "3DSOLID", "TEXT", "MTEXT",
+                 "HATCH", "CIRCLE", "ARC", "DIMENSION"]
+        per_layer: dict[str, dict[str, int]] = {}
+        for name, n in ranked[:top_layers]:
+            if n == 0:
+                continue
+            tl = " ".join(f'"{t}"' for t in types)
+            r = self.lisp('(apply (quote strcat) (mapcar (quote (lambda (ty) (strcat ty "=" (itoa (if (setq s '
+                          f'(ssget "X" (list (cons 8 "{name}") (cons 0 ty)))) (sslength s) 0)) ";"))) (quote ({tl}))))')
+            per_layer[name] = {k: int(v) for k, v in (kv.split("=", 1) for kv in r.split(";") if "=" in kv)
+                               if int(v)}
+        blocks = []
+        for b in c(lambda: doc.Blocks):
+            nm = str(c(lambda b=b: b.Name))
+            if nm.startswith("*"):
+                continue
+            blocks.append({"block": nm, "entities_in_definition": int(c(lambda b=b: b.Count))})
+        try:
+            lo, hi = c(lambda: doc.GetVariable("EXTMIN")), c(lambda: doc.GetVariable("EXTMAX"))
+            extents = [round(lo[0], 2), round(lo[1], 2), round(hi[0], 2), round(hi[1], 2)]
+        except Exception:  # noqa: BLE001
+            extents = None
+        total = sum(counts.values())
+        heavy = {k: v for k, v in counts.items() if k.upper().startswith("DLX_") and v}
+        notes = []
+        if heavy:
+            notes.append(f"DIALux calculation/mesh layers present {heavy}: work on a sanitised COPY "
+                         "(live_sanitize), never on the raw export; hiding layers does not help.")
+        if total > 100000:
+            notes.append("Very large drawing: expect slow COM calls and AutoCAD timeouts.")
+        return {"drawing": self._doc_name(), "header_insunits": int(c(lambda: doc.GetVariable("INSUNITS"))),
+                "extents": extents, "entities": total,
+                "layers": [{"layer": k, "entities": v} for k, v in ranked if v],
+                "top_layers_by_type": per_layer, "blocks": blocks[:60],
+                "layers_skipped_unusual_names": [n for n in layer_names if n not in ok][:20],
+                "protected_base": bool(self.is_protected(str(c(lambda: doc.FullName)))), "notes": notes}
+
+    def sanitize(self, strip_layers: list[str], scale: float | None = None, set_units_mm: bool = True,
+                 dry_run: bool = True, confirm_copy: bool = False) -> dict[str, Any]:
+        """Erase heavy layers (and optionally scale the rest) in the ACTIVE drawing. Must be a copy:
+        base drawings are refused, and the real run needs confirm_copy=true. Erase/scale run inside
+        AutoCAD, so even 88,000 objects take seconds, not minutes. Locked layers cannot be erased."""
+        full = str(self.com.call(lambda: self.doc.FullName))
+        if self.is_protected(full):
+            raise ValueError(f"{Path(full).name} is a registered BASE drawing. Make a working copy "
+                             "first (floor_from_base), open it, then sanitize that.")
+        bad = [n for n in strip_layers if not self._lisp_name(n) or "," in n]
+        if bad:
+            raise ValueError(f"Unsupported layer name(s): {bad}")
+        if scale is not None and not (math.isfinite(scale) and scale > 0):
+            raise ValueError("scale must be a positive number")
+        joined = ",".join(strip_layers)
+        n_strip = int(self.lisp(f'(if (setq s (ssget "X" (list (cons 8 "{joined}")))) (sslength s) 0)')) \
+            if strip_layers else 0
+        total = int(self.lisp('(if (setq s (ssget "X")) (sslength s) 0)'))
+        report = {"drawing": Path(full).name, "entities_before": total, "to_erase": n_strip,
+                  "scale": scale, "set_units_mm": set_units_mm, "dry_run": dry_run}
+        if dry_run:
+            report["next"] = ("Nothing changed. Check the numbers, make sure this is a working COPY, "
+                              "then call again with dry_run=false and confirm_copy=true.")
+            return report
+        if not confirm_copy:
+            raise ValueError("Real run refused: confirm this drawing is a working COPY (confirm_copy=true).")
+        with self._op():
+            if n_strip:
+                self.lisp(f'(if (setq s (ssget "X" (list (cons 8 "{joined}")))) '
+                          '(progn (command "_.ERASE" s "") (sslength s)) 0)', timeout=120)
+            if scale is not None and scale != 1.0:
+                self.lisp(f'(if (setq s (ssget "X")) (progn (command "_.SCALE" s "" "0,0,0" {scale!r}) '
+                          '(sslength s)) 0)', timeout=120)
+            if set_units_mm:
+                self.com.call(lambda: self.doc.SetVariable("INSUNITS", 4))
+        after = int(self.lisp('(if (setq s (ssget "X")) (sslength s) 0)'))
+        left = int(self.lisp(f'(if (setq s (ssget "X" (list (cons 8 "{joined}")))) (sslength s) 0)')) \
+            if strip_layers else 0
+        report.update(entities_after=after, still_on_stripped_layers=left, dry_run=False)
+        if left:
+            report["warning"] = "Some objects remain on those layers (locked or in use): unlock them."
+        self._record("sanitize", erased=n_strip, scale=scale, entities_after=after)
+        return report
+
+    def resync(self, prune: bool = False) -> dict[str, Any]:
+        """After a dropped connection: what the registry says vs what is really in the drawing."""
+        data = self._load()
+        groups = self._groups()
+        missing = sorted(d for d in data["devices"] if d.upper() not in groups)
+        routes_missing = sorted(c for c in data["routes"]
+                                if ("R-" + c).upper() not in groups)
+        untracked = sorted(g for g in groups if g not in {d.upper() for d in data["devices"]}
+                           and g not in {("R-" + c).upper() for c in data["routes"]})
+        if prune:
+            for d in missing:
+                data["devices"].pop(d, None)
+            for c in routes_missing:
+                data["routes"].pop(c, None)
+            self._save(data)
+            self._record("resync", pruned=len(missing) + len(routes_missing))
+        return {"devices_in_registry": len(data["devices"]), "groups_in_drawing": len(groups),
+                "registered_but_not_in_drawing": missing, "routes_registered_but_not_drawn": routes_missing,
+                "in_drawing_but_not_registered": untracked, "pruned": prune,
+                "next": ("Re-draw or delete the entries above, or call again with prune=true to forget "
+                         "those that are gone.") if missing or routes_missing or untracked else
+                        "Registry and drawing agree."}
+
+    def circuit_lengths(self, factor: float = 1.1, unit_to_m: float | None = None) -> dict[str, Any]:
+        data = self._load()
+        u = unit_to_m if unit_to_m else 0.001 / self._scale()
+        rows = []
+        for cid, r in sorted(data["routes"].items()):
+            lu = r.get("length_units")
+            rows.append({"circuit": cid, "kind": r["kind"], "db": r.get("db"), "devices": len(r["device_ids"]),
+                         "route_length_units": lu, "route_length_m": round(lu * u, 2) if lu else None,
+                         "length_m_with_factor": round(lu * u * factor, 2) if lu else None,
+                         "stale": r.get("stale", False)})
+        circuits = {m.get("circuit") for m in data["devices"].values() if m.get("circuit")}
+        no_route = sorted(circuits - set(data["routes"]))
+        return {"unit_to_m": u, "factor": factor, "rows": rows, "circuits_without_route": no_route,
+                "stale_routes": [r["circuit"] for r in rows if r["stale"]]}
 
     def selftest(self) -> dict[str, Any]:
         """Create, move, route, undo and delete on the ACTIVE drawing, then clean up. Run it on a

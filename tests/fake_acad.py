@@ -51,6 +51,11 @@ class Group:
         self.deleted = True
 
 
+class Block:
+    def __init__(self, name, count=0):
+        self.Name, self.Count = name, count
+
+
 class Layer:
     def __init__(self, name):
         self.Name, self.color = name, 7
@@ -62,6 +67,7 @@ class Doc:
         self.ModelSpace = self._ms()
         self.Groups = Collection()
         self.Layers = Collection([Layer("0")])
+        self.Blocks = Collection()
         self.commands, self._marks, self._open = [], [], False
         self.insunits = 6
         self.vars = {}

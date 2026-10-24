@@ -205,7 +205,6 @@ def fig_excel(work: Path, dest: Path) -> bool:
     if not (shutil.which("soffice") and shutil.which("pdftoppm")):
         print("skip excel image (soffice/pdftoppm missing)")
         return False
-    from PIL import Image, ImageChops
     ws_dir = work / "xl"
     res = workbook.create(ws_dir, "demo", "load_schedule", True)
     rows = [
@@ -225,10 +224,17 @@ def fig_excel(work: Path, dest: Path) -> bool:
     del wb["Instructions"]
     for letter in ("J", "L"):  # hide phases and source columns so the picture stays readable
         data.column_dimensions[letter].hidden = True
+    return render_sheet(work, wb, data, dest)
+
+
+def render_sheet(work: Path, wb, data, dest: Path) -> bool:
+    from PIL import Image, ImageChops
     data.page_setup.orientation = "landscape"
     data.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
     data.page_setup.fitToWidth, data.page_setup.fitToHeight = 1, 0
     tmp = work / "xl" / "shot.xlsx"
+    for old in (*(work / "xl").glob("pg*.png"), work / "xl" / "shot.pdf"):
+        old.unlink(missing_ok=True)
     wb.save(tmp)
     subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(work / "xl"), str(tmp)],
                    check=True, capture_output=True, timeout=180)
@@ -242,6 +248,25 @@ def fig_excel(work: Path, dest: Path) -> bool:
     return True
 
 
+def fig_placement(work: Path, dest: Path) -> bool:
+    if not (shutil.which("soffice") and shutil.which("pdftoppm")):
+        return False
+    res = workbook.create(work / "xl", "demo", "placement_table", True)
+    rows = [["GF", "LABORATORY", "socket", 500, 400, 0, "GF-P01", "DB-GF", "GF-R1", ""],
+            ["GF", "LABORATORY", "socket", 2500, 400, 0, "GF-P01", "DB-GF", "GF-R2", ""],
+            ["GF", "LABORATORY", "data", 3000, 4500, 0, "GF-P01", "DB-GF", "GF-D1", ""],
+            ["GF", "CLASSROOM", "socket", 6500, 400, 0, "GF-P02", "DB-GF", "GF-R3", ""],
+            ["GF", "CLASSROOM", "ac", 9000, 4500, 0, "GF-AC1", "DB-GF", "GF-AC1", "ceiling cassette"]]
+    wb = openpyxl.load_workbook(res["path"])
+    data = wb["Data"]
+    for r, vals in enumerate(rows, start=2):
+        for c, v in enumerate(vals, start=1):
+            data.cell(row=r, column=c, value=v)
+    data.delete_rows(len(rows) + 4, 400)
+    del wb["Instructions"]
+    return render_sheet(work, wb, data, dest)
+
+
 def main() -> None:
     IMG.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="readme_imgs_"))
@@ -251,6 +276,7 @@ def main() -> None:
     fig_views(out, IMG / "demo-views.png")
     fig_dialux(demo, IMG / "demo-dialux-import.png")
     fig_excel(work, IMG / "demo-load-schedule.png")
+    fig_placement(work, IMG / "demo-placement-table.png")
     s = demo["schedule"]
     summary = {"validation_ok": demo["validation"]["ok"], "device_counts": demo["validation"]["device_counts"],
                "schedule_total": {k: s[k] for k in ("total_luminaires", "installed_watts", "installed_kw", "complete")},

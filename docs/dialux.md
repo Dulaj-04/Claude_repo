@@ -22,6 +22,12 @@ Re-importing is safe: luminaires at the same position update in place, never dup
 ## Straight into AutoCAD (live mode)
 *"Run `live_import_luminaires` for floor 4F with these block names and this transform."* It defaults to a **dry run** (counts and first positions). Repeat with `dry_run=false` to draw them in the open drawing as **one undo step**; `live_undo` reverts the whole import. Wattage and luminaire type are stored with each device and shown by `live_list_devices`.
 
+## Heavy exports
+A raw DIALux DWG can hold a very large number of calculation objects (layers `DLX_OBJ`, `DLX_CALC`,
+`DLX_APERT`) in metres. Look first with `intake_scan` (files on disk) or `live_inventory` (open
+drawing), then make a slim millimetre copy with `dxf_sanitize` or `live_sanitize`. See
+[project-workflow.md](project-workflow.md).
+
 ## Checks that protect you
 - **Scale/units check**: compares the imported span with the rooms' span; a ratio far from 1 is flagged even when points happen to fall inside some room (metres vs millimetres).
 - **Outside-rooms count**: luminaires that fall in no room.
