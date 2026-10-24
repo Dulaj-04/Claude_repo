@@ -120,6 +120,7 @@ class DxfBackend(DrawingBackend):
         ref.add_auto_attribs(attribs)
         for att in ref.attribs:
             att.dxf.layer = layer
+            att.dxf.rotation = 0.0  # labels stay horizontal even when the symbol is rotated
 
     def add_polyline(self, layer, points):
         self.msp.add_lwpolyline(points, dxfattribs={"layer": layer})

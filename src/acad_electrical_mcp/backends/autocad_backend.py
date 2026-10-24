@@ -175,6 +175,10 @@ class AutoCadBackend(DrawingBackend):
             if att.TagString in attribs:
                 att.TextString = str(attribs[att.TagString])
             att.Layer = layer
+            try:
+                att.Rotation = 0.0  # labels stay horizontal even when the symbol is rotated
+            except Exception:  # noqa: BLE001 - cosmetic
+                pass
 
     def add_polyline(self, layer, points):
         p = self.ms.AddLightWeightPolyline(_flat(points))

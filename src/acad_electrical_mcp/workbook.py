@@ -157,13 +157,19 @@ def create(workspace: Path, project: str, kind: str, overwrite: bool = False) ->
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = head_fill if not col["formula"] else PatternFill("solid", fgColor="595959")
         cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.column_dimensions[get_column_letter(c)].width = max(14, min(34, len(col["header"]) + 4))
+        wide = col["key"] in ("description", "source", "notes", "load", "method", "cable", "function",
+                              "room_name")
+        ws.column_dimensions[get_column_letter(c)].width = (
+            30 if wide else max(14, min(34, len(col["header"]) + 4)))
         if col["note"]:
             from openpyxl.comments import Comment
             cell.comment = Comment(col["note"], "acad-electrical-mcp")
         if col["formula"]:
             for r in range(2, ROWS + 2):
-                ws.cell(row=r, column=c, value=col["formula"].format(r=r)).fill = calc_fill
+                cell_f = ws.cell(row=r, column=c, value=col["formula"].format(r=r))
+                cell_f.fill = calc_fill
+                if col["key"] != "ok":
+                    cell_f.number_format = "0.00"
         if col["type"] == "enum" and col["enum"]:
             dv = DataValidation(type="list", formula1='"' + ",".join(col["enum"]) + '"',
                                 allow_blank=True)
