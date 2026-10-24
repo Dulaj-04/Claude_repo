@@ -53,9 +53,9 @@ def test_lisp_roundtrip_chunking_and_errors(sch):
 def test_lisp_timeout_when_autocad_busy(sch, monkeypatch):
     s, _, app = sch
     app.ActiveDocument.SendCommand = lambda cmd: None  # AutoCAD never answers
-    monkeypatch.setattr("acad_electrical_mcp.schematic.time.sleep", lambda *_: None)
+    monkeypatch.setattr("acad_electrical_mcp.live.time.sleep", lambda *_: None)
     t = iter(range(0, 1000, 10))
-    monkeypatch.setattr("acad_electrical_mcp.schematic.time.time", lambda: next(t))
+    monkeypatch.setattr("acad_electrical_mcp.live.time.time", lambda: next(t))
     with pytest.raises(BackendError, match="did not answer"):
         s.lisp("(x)", timeout=15)
 

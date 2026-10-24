@@ -53,8 +53,11 @@ def _t_lighting_from_dialux() -> tuple[list, list]:
         _inp("circuit_plan", "Circuit grouping and DB location", "Needed to assign circuits and draw routes.", "decision", "Which luminaires share a circuit, circuit ids (e.g. 4F-L01), and where the DB is."),
     ]
     steps = [
+        _step("s0a", "Inventory the files you were given", "review", ["intake_scan"], [], [], "Lists every file, its type, floor, units and size; flags missing floors, duplicates and scale mismatches between floors. Nothing is changed."),
+        _step("s0b", "Protect the base drawings and make working copies", "drawing", ["base_register", "floor_from_base"], ["arch_dxf"], ["s0a"], "Base drawings become read-only for the MCP; every floor is drawn in its own copy."),
+        _step("s0c", "Slim down a heavy DIALux export (on a copy)", "drawing", ["dxf_sanitize", "live_inventory", "live_sanitize"], ["dialux_export"], ["s0b"], "Heavy DIALux exports (hundreds of thousands of mesh objects) can stall AutoCAD. Strips the calculation/mesh layers and scales metres to millimetres, always on a copy."),
         _step("s1", "Prepare the floor model (rooms + architectural reference)", "drawing", ["register_reference", "prepare_floor_model"], ["arch_dxf", "room_list"], [], "Registers the reference file and rooms; differences from approved names are reported, not overwritten."),
-        _step("s2", "Inspect the DIALux export", "review", ["dialux_inspect"], ["dialux_export"], [], "Lists block names, counts, layers and units. Decide which blocks are luminaires / emergency signs."),
+        _step("s2", "Inspect the DIALux export", "review", ["dialux_inspect", "live_inventory"], ["dialux_export"], ["s0c"], "Lists block names, counts, layers and units. Decide which blocks are luminaires / emergency signs."),
         _step("s3", "Align the DIALux layout to the architecture", "calc", ["dialux_align"], ["alignment_points"], ["s2"], "Check the residual is near zero."),
         _step("s4", "Read and check the luminaire list", "input", ["workbook_read", "import_luminaire_list"], ["luminaire_list"], [], "Confirms wattage per luminaire type; lists types with missing wattage."),
         _step("s5", "Import luminaires as a changeset and review it", "drawing", ["dialux_import", "preview_changes"], [], ["s1", "s3", "s4"], "Review counts per block, luminaires outside rooms, scale warning, missing wattage. Apply only after the user agrees."),
@@ -150,6 +153,34 @@ def _t_full_project() -> tuple[list, list]:
     return [], steps
 
 
+def _t_floor_set_workflow() -> tuple[list, list]:
+    inputs = [
+        _inp("requirement", "Requirement document and work plan", "Defines scope, supply, special loads and the deliverables.", "file", "Give the file paths (PDF/Markdown)."),
+        _inp("reference_material", "Reference reports, tutorials and sample tables", "Method, table structure, naming and style to follow.", "file", "Give the folder or file paths; say which one is master when two disagree."),
+        _inp("base_drawings", "Base architectural drawings per floor, with their role", "Never edited: every floor is drawn in its own copy. Combined-room floors may use a different base.", "file", "Floor to file, and which floors share a base (for example ground and top floor combined)."),
+        _inp("room_plan", "Room plan (image or table) with approved ids and names", "Rooms drive placement, areas and checks.", "table", "Room id, name and which floor; flag rooms that span two floors."),
+        _inp("dialux_exports", "DIALux export per floor", "Source of luminaire positions and wattage.", "file", "Final exports only; say if a floor was re-exported."),
+        _inp("load_workbooks", "A/C and socket workbooks (counts per room)", "Decide what is placed in each room; no template copied between rooms.", "workbook", "placement_table sheet per floor, or your own workbooks mapped to it.", "placement_table"),
+        _inp("label_style", "Label and legend style", "Short names with the floor in them, a key box, plain style.", "decision", "Approve the style on the first floor; it is then applied everywhere."),
+        _inp("demand_method", "Demand and diversity method", "Maximum demand and sizing follow your method, not a default.", "value", "Simultaneity table / factors and their source."),
+    ]
+    steps = [
+        _step("t0", "S0 Intake: inventory every input", "review", ["intake_scan", "base_register"], [], [], "Hashes, units, extents, floors present and missing, duplicates, scale mismatches between floors. Gate: anything missing or unclear?"),
+        _step("t1", "S1 Plan and questions (hard gate)", "review", ["plan_define", "plan_approve"], ["requirement", "reference_material"], ["t0"], "Short questions with a default each; answer 'defaults' or by letter. Nothing is drawn before this is approved."),
+        _step("t2", "S2 Base preparation per floor", "drawing", ["floor_from_base", "dxf_sanitize", "live_sanitize", "prepare_floor_model"], ["base_drawings", "room_plan"], ["t1"], "Copy the base, strip heavy layers, fix units and scale, set rooms. Gate: room names, combined rooms, unit conflicts."),
+        _step("t3", "S3 Lighting import from DIALux", "drawing", ["dialux_inspect", "dialux_align", "dialux_import", "live_import_luminaires"], ["dialux_exports"], ["t2"], "Counts and watts must equal the DIALux luminaire list. Gate: circuit grouping and DB position."),
+        _step("t4", "S4 Loads from the workbooks (A/C, sockets), floor by floor", "drawing", ["place_from_table", "live_place_from_table", "plan_approve_floor", "plan_confirm_floor"], ["load_workbooks"], ["t2"], "Draw the first floor, show it, wait for confirmation, then the next. Never one floor ahead."),
+        _step("t5", "S5 Routing and circuit lengths", "calc", ["plan_routes", "live_route", "export_circuit_lengths", "live_circuit_lengths"], [], ["t4"], "Every circuit gets a route and a length; lengths go into a workbook range for cable sizing."),
+        _step("t6", "S6 Labels, legend and key", "drawing", ["live_add_text"], ["label_style"], ["t4"], "Legend and key box block are not automated yet.", False),
+        _step("t7", "S7 Verify against the workbooks", "review", ["verify_placement", "live_verify_placement", "validate_drawing"], [], ["t5"], "Counts per room and type match the workbooks; deviations are listed with a reason."),
+        _step("t8", "S8 Calculation handoff", "calc", ["export_circuit_lengths", "load_summary"], ["demand_method"], ["t7"], "Maximum demand from your factors is automated; cable sizing, transformer/generator and short circuit are not.", False),
+        _step("t9", "S9 Single line diagrams", "drawing", [], [], ["t8"], "Not built yet.", False),
+        _step("t10", "S10 Export and plot", "output", ["export_package", "get_preview_image"], [], ["t7"], "DXF/PNG/PDF with a manifest. Batch plotting of open drawings is not automated yet."),
+        _step("t11", "S11 Quantities for the BOQ and report", "output", ["export_quantities"], [], ["t7"], "Counts per type and floor as a named range; BOQ prices are not automated."),
+    ]
+    return inputs, steps
+
+
 TEMPLATES: dict[str, dict[str, Any]] = {
     "lighting_from_dialux": {"title": "Lighting layout from DIALux", "build": _t_lighting_from_dialux,
         "summary": "Import a DIALux layout for a floor, total the lighting load, assign circuits, export."},
@@ -161,6 +192,8 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "summary": "Prepare a floor model, place devices, circuits and routes, validate and export."},
     "sld_and_boq": {"title": "Single line diagram and BOQ", "build": _t_sld_and_boq,
         "summary": "Quantities from the model; SLD and BOQ generation are not built yet."},
+    "floor_set_workflow": {"title": "Multi-floor project workflow (intake to quantities)", "build": _t_floor_set_workflow,
+        "summary": "Stages S0-S11 with approval gates: intake, plan, base preparation, lighting, loads floor by floor, routes and lengths, verify, export."},
     "full_project": {"title": "Electrical installation project (whole work plan)", "build": _t_full_project,
         "summary": "The 13-part work plan as a roadmap; each part runs as its own plan."},
 }
@@ -218,7 +251,7 @@ def _log(plan: dict, text: str) -> None:
 
 def define(project: str, title: str, goal: str, success_criteria: list[str],
            scope_in: list[str] | None = None, scope_out: list[str] | None = None,
-           template: str | None = None) -> dict[str, Any]:
+           template: str | None = None, floors: list[str] | None = None) -> dict[str, Any]:
     safe_name(project, "project")
     if not title.strip() or not goal.strip():
         raise PlanError("A plan needs a title and a goal statement.")
@@ -234,6 +267,8 @@ def define(project: str, title: str, goal: str, success_criteria: list[str],
             "goal": {"statement": goal, "success_criteria": success_criteria,
                      "scope_in": scope_in or [], "scope_out": scope_out or [],
                      "approved": False, "approval_note": None},
+            "floors": {safe_name(f, "floor"): {"approved": False, "confirmed": False, "note": None}
+                       for f in floors or []},
             "inputs": inputs, "steps": steps, "assumptions": [], "log": []}
     _log(plan, f"Plan defined from template {template or 'none'}; waiting for the goal to be approved.")
     return plan
@@ -388,6 +423,11 @@ def render_markdown(plan: dict) -> str:
         if not s["built"]:
             extra += " [not automated yet]"
         lines.append(f"- [{box}] {s['id']}. {s['title']}{extra}")
+    fl = plan.get("floors") or {}
+    if fl:
+        lines += ["", "**Floors:** " + "; ".join(
+            f"{f} {'confirmed' if v['confirmed'] else ('OPEN, awaiting your check' if v['approved'] else 'not started')}"
+            for f, v in fl.items())]
     miss = [i for i in plan["inputs"] if i["status"] == "missing"]
     if miss:
         lines += ["", "**Needed from you:**"] + [f"- {i['title']} ({i['id']}): {i['how']}" for i in miss]
@@ -405,4 +445,128 @@ def summary(plan: dict) -> dict[str, Any]:
             "inputs": [{k: i[k] for k in ("id", "title", "kind", "status", "reference", "workbook")}
                        for i in plan["inputs"]],
             "assumptions": plan["assumptions"], "next": next_actions(plan),
+            "floors": plan.get("floors", {}), "still_open": still_open(plan),
             "checklist": render_markdown(plan), "updated": plan["updated"]}
+
+
+# --------------------------------------------------------------------------- floor scopes and gates
+def approve_floor(plan: dict, floor: str, note: str | None = None, force: bool = False) -> dict:
+    """Allow drawing on one floor. Only one floor may be open at a time: the previous floor must
+    be confirmed by the user first (force=true overrides, e.g. to work in parallel)."""
+    if not plan["goal"]["approved"]:
+        raise PlanError("The goal is not approved yet. Approve the goal first (plan_approve).")
+    floors = plan.setdefault("floors", {})
+    if floor not in floors:
+        floors[floor] = {"approved": False, "confirmed": False, "note": None}
+    open_ = [f for f, v in floors.items() if v["approved"] and not v["confirmed"] and f != floor]
+    if open_ and not force:
+        raise PlanError(f"Floor {open_[0]} is still open: ask the user to check it, then call "
+                        "plan_confirm_floor. One floor at a time (force=true to work in parallel).")
+    floors[floor].update(approved=True, confirmed=False, note=note)
+    _log(plan, f"Floor {floor} approved for drawing" + (f": {note}" if note else ""))
+    return floors[floor]
+
+
+def confirm_floor(plan: dict, floor: str, note: str | None = None) -> dict:
+    f = plan.setdefault("floors", {}).get(floor)
+    if not f or not f["approved"]:
+        raise PlanError(f"Floor {floor!r} was never approved for drawing.")
+    f.update(confirmed=True, note=note or f.get("note"))
+    _log(plan, f"Floor {floor} confirmed by the user" + (f": {note}" if note else ""))
+    return f
+
+
+def active_floor(plan: dict) -> str | None:
+    open_ = [f for f, v in plan.get("floors", {}).items() if v["approved"] and not v["confirmed"]]
+    return open_[0] if len(open_) == 1 else None
+
+
+def gate_check(plan: dict | None, floor: str | None = None) -> str | None:
+    """None when drawing is allowed, otherwise the reason it is refused."""
+    if plan is None or not plan["goal"]["approved"]:
+        return ("no approved plan. Define the goal with plan_define, show it to the user and call "
+                "plan_approve after they agree.")
+    floors = plan.get("floors") or {}
+    if not floors:
+        return None
+    if floor is not None:
+        f = floors.get(floor)
+        if not f or not f["approved"]:
+            return (f"floor {floor} is not approved for drawing. Ask the user, then call "
+                    "plan_approve_floor.")
+        if f["confirmed"]:
+            return (f"floor {floor} was already confirmed by the user. Re-open it with "
+                    "plan_approve_floor if it must change.")
+        return None
+    open_ = [f for f, v in floors.items() if v["approved"] and not v["confirmed"]]
+    if len(open_) == 1:
+        return None
+    if not open_:
+        return ("no floor is approved for drawing. Ask the user which floor to start with, then "
+                "call plan_approve_floor.")
+    return f"several floors are open ({', '.join(open_)}): say which one you are drawing."
+
+
+def add_open_item(plan: dict, text: str) -> dict:
+    return note(plan, text, "open", None)
+
+
+def resolve_open_item(plan: dict, index: int, how: str | None = None) -> dict:
+    items = plan["assumptions"]
+    if not 0 <= index < len(items) or items[index]["kind"] != "open":
+        raise PlanError("No open item with that number. See still_open in plan_show.")
+    items[index]["resolved"] = how or "done"
+    _log(plan, f"Open item {index} resolved: {items[index]['text'][:60]}")
+    return items[index]
+
+
+def still_open(plan: dict) -> dict[str, Any]:
+    return {
+        "open_items": [{"number": i, "text": n["text"]} for i, n in enumerate(plan["assumptions"])
+                       if n["kind"] == "open" and not n.get("resolved")],
+        "unfinished_steps": [s["id"] for s in plan["steps"] if s["status"] not in _DONE],
+        "missing_inputs": [i["id"] for i in plan["inputs"] if i["status"] == "missing"],
+        "floors_awaiting_confirmation": [f for f, v in plan.get("floors", {}).items()
+                                         if v["approved"] and not v["confirmed"]],
+    }
+
+
+# --------------------------------------------------------------------------- change impact
+IMPACT_EDGES: dict[str, list[str]] = {
+    "architecture": ["rooms", "drawings"], "rooms": ["drawings", "lighting_schedule"],
+    "dialux_export": ["luminaires"], "luminaires": ["drawings", "loads", "circuits"],
+    "sockets": ["drawings", "loads", "circuits"], "ac_units": ["drawings", "loads", "circuits"],
+    "circuits": ["routes", "drawings", "phase_balance"], "routes": ["cable_lengths", "drawings"],
+    "cable_lengths": ["cable_sizes"], "load_schedule": ["loads"], "loads": ["demand", "phase_balance"],
+    "demand_factors": ["demand"], "demand": ["transformer", "generator", "cable_sizes"],
+    "phase_balance": ["cable_sizes"], "transformer": ["short_circuit", "sld", "boq"],
+    "generator": ["sld", "boq"], "cable_sizes": ["protection", "short_circuit", "sld", "boq"],
+    "protection": ["sld"], "short_circuit": ["sld", "report"], "sld": ["report"],
+    "drawings": ["quantities"], "quantities": ["boq"], "boq": ["report"],
+    "lighting_schedule": ["loads"],
+}
+IMPACT_LABELS = {
+    "rooms": "room list and areas", "drawings": "CAD drawings", "luminaires": "luminaire list",
+    "loads": "load schedule", "circuits": "circuit list", "routes": "routes", "cable_lengths": "circuit lengths",
+    "cable_sizes": "cable sizes", "demand": "maximum demand", "phase_balance": "phase balance",
+    "transformer": "transformer selection", "generator": "generator selection", "protection": "protection devices",
+    "short_circuit": "short-circuit calculation", "sld": "single line diagrams", "quantities": "quantities",
+    "boq": "BOQ", "report": "report", "lighting_schedule": "lighting schedule",
+}
+
+
+def impact_of(change: str) -> dict[str, Any]:
+    key = change.strip().lower().replace(" ", "_").replace("-", "_")
+    if key not in IMPACT_EDGES and key not in IMPACT_LABELS:
+        raise PlanError(f"Unknown change {change!r}. Known: {sorted(set(IMPACT_EDGES) | set(IMPACT_LABELS))}")
+    seen, queue = [], [key]
+    while queue:
+        for nxt in IMPACT_EDGES.get(queue.pop(0), []):
+            if nxt not in seen and nxt != key:
+                seen.append(nxt)
+                queue.append(nxt)
+    labels = [IMPACT_LABELS.get(x, x) for x in seen]
+    return {"change": key, "affected": labels,
+            "cad_drawings_affected": "drawings" in seen,
+            "note": ("Tell the user this list before changing anything, and say which of these "
+                     "outputs must be regenerated.")}

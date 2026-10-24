@@ -1,12 +1,14 @@
 # Tool reference
 
-All 63 MCP tools, generated from the running server (`python scripts/gen_tool_docs.py`). Do not edit by hand.
+All 83 MCP tools, generated from the running server (`python scripts/gen_tool_docs.py`). Do not edit by hand.
 
 Floor tools take `project` and `floor` (letters, digits, `_`, `-`). Coordinates are in the drawing's units.
 
 | Group | Tools |
 | --- | --- |
-| Plan-first workflow | `plan_templates`, `plan_define`, `plan_show`, `plan_next`, `plan_approve`, `plan_update_step`, `plan_provide_input`, `plan_add_step`, `plan_add_input`, `plan_note` |
+| Plan-first workflow | `plan_templates`, `plan_define`, `plan_show`, `plan_next`, `plan_approve`, `plan_update_step`, `plan_provide_input`, `plan_add_step`, `plan_add_input`, `plan_note`, `plan_approve_floor`, `plan_confirm_floor`, `plan_resolve`, `plan_impact` |
+| Inputs, base drawings and heavy files | `intake_scan`, `base_register`, `base_check`, `floor_from_base`, `dxf_sanitize` |
+| Placement tables, lengths and quantities | `place_from_table`, `verify_placement`, `export_circuit_lengths`, `export_quantities` |
 | Excel inputs and calculations | `workbook_create`, `workbook_read`, `load_summary` |
 | Inspect | `register_reference`, `inspect_drawing`, `list_devices`, `list_floors`, `get_preview_image` |
 | Prepare | `prepare_floor_model`, `prepare_template` |
@@ -14,7 +16,7 @@ Floor tools take `project` and `floor` (letters, digits, `_`, `-`). Coordinates 
 | Apply, undo, sync | `preview_changes`, `apply_changes`, `undo_last`, `sync_from_drawing` |
 | DIALux import and lighting schedule | `dialux_inspect`, `dialux_align`, `import_luminaire_list`, `dialux_import`, `lighting_schedule` |
 | Output | `generate_views`, `export_package`, `validate_drawing` |
-| Live editing (plan symbols) | `live_connect`, `live_selftest`, `live_scan`, `live_adopt`, `live_list_devices`, `live_texts`, `live_place`, `live_import_luminaires`, `live_move`, `live_delete`, `live_assign`, `live_route`, `live_add_text`, `live_add_polyline`, `live_zoom`, `live_undo`, `live_save` |
+| Live editing (plan symbols) | `live_connect`, `live_selftest`, `live_scan`, `live_adopt`, `live_list_devices`, `live_texts`, `live_place`, `live_import_luminaires`, `live_move`, `live_delete`, `live_assign`, `live_route`, `live_add_text`, `live_add_polyline`, `live_zoom`, `live_undo`, `live_save`, `live_place_from_table`, `live_verify_placement`, `live_circuit_lengths`, `live_inventory`, `live_sanitize`, `live_resync`, `work_log` |
 | Mode switch | `live_set_mode` |
 | Schematic mode (AutoCAD Electrical) | `sch_detect`, `sch_check_commands`, `sch_modules`, `sch_read`, `sch_probe`, `sch_run_lisp` |
 | AutoCAD utilities (Windows) | `acad_status`, `acad_open`, `acad_run_command` |
@@ -31,7 +33,7 @@ _No parameters._
 
 ### `plan_define`
 
-Start a plan for a large request BEFORE doing any work: a title, a one-paragraph goal, the success criteria ('done when...'), what is in and out of scope, and optionally a template that pre-fills the steps and the inputs needed from the user. The plan starts as a draft: show it to the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan.
+Start a plan for a large request BEFORE doing any work: a title, a one-paragraph goal, the success criteria ('done when...'), what is in and out of scope, and optionally a template that pre-fills the steps and the inputs needed from the user. The plan starts as a draft: show it to the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan. floors = the floors to draw (e.g. ["GF","1F"]): drawing is then allowed on ONE approved floor at a time (plan_approve_floor), and the next floor only after the user confirmed the previous one.
 
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
@@ -43,6 +45,7 @@ Start a plan for a large request BEFORE doing any work: a title, a one-paragraph
 | `scope_out` | list of string | no | `None` |
 | `template` | string | no | `None` |
 | `replace` | boolean | no | `False` |
+| `floors` | list of string | no | `None` |
 
 ### `plan_show`
 
@@ -125,14 +128,156 @@ Add something the plan needs from the user: why it is needed and exactly how to 
 
 ### `plan_note`
 
-Record an assumption, a decision or a note with its source (who/what it came from), so it is visible in the plan and in the report. Use it for every number or choice the user gave you.
+Record an assumption, a decision or a note with its source (who/what it came from), so it is visible in the plan and in the report. Use it for every number or choice the user gave you. kind='open' records something still unresolved (e.g. a symbol overlap not fixed yet): it stays in still_open until plan_resolve.
 
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
 | `project` | string | yes |  |
 | `text` | string | yes |  |
-| `kind` | `assumption` \| `decision` \| `note` | no | `assumption` |
+| `kind` | `assumption` \| `decision` \| `note` \| `open` | no | `assumption` |
 | `source` | string | no | `None` |
+
+### `plan_approve_floor`
+
+Open ONE floor for drawing after the user said yes to starting it. Only one floor is open at a time: the previous floor must first be confirmed by the user (plan_confirm_floor), or pass force=true to work on several. In strict mode drawing tools refuse for floors that are not open.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `user_confirmed` | boolean | yes |  |
+| `note` | string | no | `None` |
+| `force` | boolean | no | `False` |
+
+### `plan_confirm_floor`
+
+Record that the USER checked the floor and accepts it. Only after this can the next floor be opened, and the floor is locked against further drawing until re-opened. Show a preview first (get_preview_image or live_zoom) and ask; never confirm on your own.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `user_confirmed` | boolean | yes |  |
+| `note` | string | no | `None` |
+
+### `plan_resolve`
+
+Mark an open item (plan_note kind='open'; numbers are in still_open) as resolved.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `number` | integer | yes |  |
+| `how` | string | no | `None` |
+
+### `plan_impact`
+
+What a change affects downstream, so you can tell the user BEFORE changing anything. Examples: demand_factors, luminaires, circuits, routes, cable_lengths, loads, transformer, architecture. Shows e.g. that demand factors change cable sizes, SLD, BOQ and report but not the CAD drawings.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `change` | string | yes |  |
+
+## Inputs, base drawings and heavy files
+
+Inventory a project folder, protect base drawings, make per-floor working copies, slim heavy DIALux exports.
+
+### `intake_scan`
+
+Inventory a folder of project inputs on this PC (read-only): every drawing, workbook, PDF, image and DIALux file with its kind, floor, size, hash and (for DXF) units, extents and layers. Reports floors missing from a set, duplicate files, floors whose scale or units disagree, heavy DIALux layers and files that cannot be imported. Run this first on a new project folder.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `folder` | string | yes |  |
+| `expected_floors` | list of string | no | `None` |
+
+### `base_register`
+
+Protect a drawing (architectural base, template) so the MCP never writes to it: live tools refuse while it is the active drawing and live_save refuses to save over it. Records its hash.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `path` | string | yes |  |
+| `role` | string | no | `base` |
+
+### `base_check`
+
+Prove the registered base drawings are unchanged (hash comparison); lists any that changed or went missing.
+
+_No parameters._
+
+### `floor_from_base`
+
+Copy a base drawing to a new working file for one floor (default name <floor>_<base name>). The base is registered as protected and only read. Open the copy in AutoCAD and draw there.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `base_path` | string | yes |  |
+| `floor` | string | yes |  |
+| `dest_dir` | string | yes |  |
+| `name` | string | no | `None` |
+| `overwrite` | boolean | no | `False` |
+
+### `dxf_sanitize`
+
+Make a slim working copy of a heavy DXF (e.g. a raw DIALux export): erase layers such as DLX_OBJ, DLX_CALC, DLX_APERT and optionally scale to millimetres (from_units='m' multiplies by 1000). The source is only read and its hash is checked afterwards; the destination may not be a registered base file. For a DWG use live_sanitize in AutoCAD, or save it as DXF first.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `source` | string | yes |  |
+| `destination` | string | yes |  |
+| `strip_layers` | list of string | yes |  |
+| `scale` | number | no | `None` |
+| `from_units` | `m` \| `cm` \| `inch` \| `mm` | no | `None` |
+| `overwrite` | boolean | no | `False` |
+
+## Placement tables, lengths and quantities
+
+Draw from a placement sheet, verify counts, export lengths and quantities as named ranges.
+
+### `place_from_table`
+
+Build a CHANGESET from a filled placement_table workbook (workbook_create kind=placement_table): one row per device with room, type, X, Y, circuit. Refuses rooms that all got identical device mixes without a note (a copied template) unless allow_identical=true. offset/limit do a batch at a time and report what remains. Repeats create no duplicates. Nothing is drawn until apply_changes.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+| `offset` | integer | no | `0` |
+| `limit` | integer | no | `None` |
+| `allow_identical` | boolean | no | `False` |
+| `tolerance` | number | no | `0.01` |
+
+### `verify_placement`
+
+Compare the floor model with the placement table: expected vs actual device count for every room and type, with a list of mismatches. Run after applying and before showing the floor.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+
+### `export_circuit_lengths`
+
+Circuit lengths from the routes in the floor model, as a workbook range for cable sizing and the BOQ (<workspace>/<project>/output/<floor>/circuit_lengths.xlsx, named range Circuit_Lengths_<floor>). factor = ceiling-route allowance (default 1.1). unit_to_m = metres per drawing unit if the model's units are not known. Circuits without a route are listed.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `factor` | number | no | `1.1` |
+| `unit_to_m` | number | no | `None` |
+
+### `export_quantities`
+
+Counts per floor, device type and luminaire type from the floor models, as a workbook range (<workspace>/<project>/output/quantities.xlsx, named range Quantities) for the BOQ and report.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floors` | list of string | no | `None` |
 
 ## Excel inputs and calculations
 
@@ -145,7 +290,7 @@ Create an Excel input sheet for the user to fill in (instructions sheet, 'Data' 
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
 | `project` | string | yes |  |
-| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` | yes |  |
+| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` \| `placement_table` | yes |  |
 | `overwrite` | boolean | no | `False` |
 
 ### `workbook_read`
@@ -155,7 +300,7 @@ Read and validate a filled-in sheet (default: the project's inputs/<kind>.xlsx):
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
 | `project` | string | yes |  |
-| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` | yes |  |
+| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` \| `placement_table` | yes |  |
 | `path` | string | no | `None` |
 | `plan_input_id` | string | no | `None` |
 
@@ -516,7 +661,7 @@ LIVE: draw a device symbol (reference style, correct layer) at x,y in the open d
 
 ### `live_import_luminaires`
 
-LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing, as one undo step. Same parameters as dialux_import. dry_run=true (default) only reports what would be drawn (counts per block, first positions); call again with dry_run=false to draw. Already placed luminaires at the same spot are skipped.
+LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing, as one undo step. offset/limit draw a batch at a time (report 'remaining'; check in with the user between batches). Same parameters as dialux_import. dry_run=true (default) only reports what would be drawn (counts per block, first positions); call again with dry_run=false to draw. Already placed luminaires at the same spot are skipped.
 
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
@@ -535,6 +680,8 @@ LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing
 | `watts_by_type` | object | no | `None` |
 | `circuit` | string | no | `None` |
 | `dry_run` | boolean | no | `True` |
+| `offset` | integer | no | `0` |
+| `limit` | integer | no | `None` |
 
 ### `live_move`
 
@@ -622,6 +769,74 @@ LIVE: save the open drawing (or Save As to path).
 | Parameter | Type | Required | Default |
 | --- | --- | --- | --- |
 | `path` | string | no | `None` |
+
+### `live_place_from_table`
+
+LIVE: draw devices from a filled placement_table into the OPEN drawing, as one undo step. Dry run by default. limit (default 40) draws a batch at a time: tell the user what was drawn and ask before the next batch (remaining is reported). Same refusal of copied-identical rooms as place_from_table. Already placed devices at the same spot are skipped.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+| `offset` | integer | no | `0` |
+| `limit` | integer | no | `40` |
+| `dry_run` | boolean | no | `True` |
+| `allow_identical` | boolean | no | `False` |
+
+### `live_verify_placement`
+
+LIVE: compare the devices tracked in the open drawing with the placement table: expected vs actual per room and type, with mismatches. Run before showing the floor to the user.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+
+### `live_circuit_lengths`
+
+LIVE: route lengths per circuit from the routes drawn in the open drawing (x factor for the ceiling route). Lists circuits with no route and routes made stale by a moved device. Pass export_project to also write <workspace>/<project>/output/live_circuit_lengths.xlsx with a named range for cable sizing.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `factor` | number | no | `1.1` |
+| `unit_to_m` | number | no | `None` |
+| `export_project` | string | no | `None` |
+
+### `live_inventory`
+
+LIVE: fast census of the open drawing, safe for huge DIALux exports (counts come from AutoCAD itself): entities per layer, types on the biggest layers, block definitions, units, extents, and warnings about heavy DIALux layers. Run on an unfamiliar drawing before anything else.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `top_layers` | integer | no | `6` |
+
+### `live_sanitize`
+
+LIVE: in the OPEN drawing, erase heavy layers (e.g. DLX_OBJ, DLX_CALC, DLX_APERT) and optionally scale (1000 for metres to millimetres). Runs inside AutoCAD so it is fast. Refuses a registered base drawing; the real run needs dry_run=false AND confirm_copy=true (it must be a working copy). Locked layers cannot be erased. Untested on real AutoCAD: try on a throwaway copy first.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `strip_layers` | list of string | yes |  |
+| `scale` | number | no | `None` |
+| `set_units_mm` | boolean | no | `True` |
+| `dry_run` | boolean | no | `True` |
+| `confirm_copy` | boolean | no | `False` |
+
+### `live_resync`
+
+LIVE: after a dropped connection or a crash: compare what the tools tracked with what is really in the open drawing (missing, untracked), and optionally forget entries that are gone.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `prune` | boolean | no | `False` |
+
+### `work_log`
+
+What the drawing tools did, newest last (placed, moved, routed, sanitised, saved), plus the plan's still-open list. Use it to resume after an interruption and to report what changed.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `limit` | integer | no | `30` |
 
 ## Mode switch
 

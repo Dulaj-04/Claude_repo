@@ -78,6 +78,24 @@ WORKBOOKS: dict[str, dict[str, Any]] = {
             _col("lumens", "Luminous flux [lm]", False, "number"), _col("notes", "Notes", False),
         ],
     },
+    "placement_table": {
+        "title": "Placement table",
+        "purpose": "What goes where: one row per device. Counts per room come from this sheet, so each room gets its own rows (nothing is copied from room to room).",
+        "instructions": [
+            "One row per device (a row with Qty > 1 is NOT expanded: add one row per device).",
+            "Room: the room id or name as in the floor model. X and Y are in drawing units of the base drawing.",
+            "Type: luminaire, switch, socket, data, ac, emergency or db.",
+            "Circuit and DB are optional here; the circuit is created on the DB if it does not exist.",
+            "If two rooms really do have identical contents, say why in Notes on those rows.",
+        ],
+        "columns": [
+            _col("floor", "Floor", True), _col("room", "Room", True),
+            _col("type", "Type", True, "enum", ["luminaire", "switch", "socket", "data", "ac", "emergency", "db"]),
+            _col("x", "X", True, "number"), _col("y", "Y", True, "number"),
+            _col("rotation", "Rotation (deg)", False, "number"), _col("circuit", "Circuit", False),
+            _col("db", "DB", False), _col("label", "Label", False), _col("notes", "Notes", False),
+        ],
+    },
     "cable_protection_inputs": {
         "title": "Cable and protection inputs",
         "purpose": "Per circuit inputs for cable sizing and protection checks. Table values come from your standard.",
@@ -275,8 +293,9 @@ def read(path: str, kind: str) -> dict[str, Any]:
                 val = str(raw).strip()
             row[c["key"]] = val
         key = {"load_schedule": "load_id", "cable_protection_inputs": "circuit",
-               "lighting_requirements": "room_id", "luminaire_list": "type"}[kind]
-        if row.get(key):
+               "lighting_requirements": "room_id", "luminaire_list": "type",
+               "placement_table": None}[kind]
+        if key and row.get(key):
             seen[str(row[key]).lower()].append(r_i)
         rows.append(row)
     for k, rs in seen.items():

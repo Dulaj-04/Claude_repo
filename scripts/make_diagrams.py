@@ -42,6 +42,16 @@ def pill(x, y, label, color, w=None) -> str:
             f'stroke="{color}" stroke-width="1.2"/>' + t(x + w / 2, y + 18, label, 13, color, "600", "middle"))
 
 
+def tool_count() -> int:
+    try:
+        import asyncio
+
+        from acad_electrical_mcp import server
+        return len(asyncio.run(server.mcp.list_tools()))
+    except Exception:  # package not installed: keep the picture buildable
+        return 83
+
+
 def banner() -> str:
     b = t(60, 98, "autocad-electrical-mcp", 48, TXT, "700")
     b += t(62, 134, "Plan, draw and check electrical installations", 22, MUTED)
@@ -82,10 +92,10 @@ def architecture() -> str:
     b += t(155, 378, "chat in plain language", 13, AMBER, anchor="middle")
     b += arrow(272, 240, 338, 240) + arrow(338, 262, 272, 262)
     b += box(340, 70, 420, 340, "#13203a", BLUE, 14, 2)
-    b += t(550, 104, "acad-electrical-mcp (63 tools)", 18, BLUE, "700", "middle")
-    mods = (("Plan-first engine", "goal, steps, inputs needed", RED), ("Drawing model", "changesets, preview, undo", GREEN),
+    b += t(550, 104, f"acad-electrical-mcp ({tool_count()} tools)", 18, BLUE, "700", "middle")
+    mods = (("Plan + floor gates", "goal, steps, one floor at a time", RED), ("Drawing model", "changesets, preview, undo", GREEN),
             ("Live editor", "COM, one undo step per call", BLUE), ("DIALux importer", "inspect, align, import", AMBER),
-            ("Excel sheets", "create, check, load summary", VIOLET), ("Validation", "ids, circuits, routes, files", GREY))
+            ("Excel sheets", "create, check, load summary", VIOLET), ("Protected bases", "hashes, copies, no writes", GREY))
     for i, (n, d, c) in enumerate(mods):
         x, y = 360 + (i % 2) * 200, 124 + (i // 2) * 92
         b += box(x, y, 190, 80, CARD, c, 10) + t(x + 95, y + 34, n, 14, TXT, "600", "middle") + t(x + 95, y + 58, d, 12, MUTED, anchor="middle")
@@ -150,19 +160,73 @@ def live_flow() -> str:
     return svg(1140, 380, b, "Live mode flow")
 
 
+def floor_set_flow() -> str:
+    b = t(40, 46, "A multi-floor project: one floor at a time, with gates", 26, TXT, "700")
+    b += t(40, 74, "The assistant works a floor, shows its count table, and does not start the next one until you confirm.", 15, MUTED)
+    steps = (("1", "Intake", "intake_scan", GREEN), ("2", "Slim the export", "dxf_sanitize", GREEN),
+             ("3", "Working copy", "floor_from_base", GREEN), ("4", "Open the floor", "plan_approve_floor", AMBER),
+             ("5", "Fill the table", "Excel table", VIOLET), ("6", "Place + route", "place_from_table", BLUE),
+             ("7", "Verify counts", "verify_placement", BLUE), ("8", "You confirm", "plan_confirm_floor", AMBER))
+    w, gap, y = 118, 14, 112
+    for i, (n, title, sub, c) in enumerate(steps):
+        x = 40 + i * (w + gap)
+        b += box(x, y, w, 130, CARD, c, 12, 2) + f'<circle cx="{x+22}" cy="{y+24}" r="12" fill="{c}"/>' + t(x + 22, y + 29, n, 13, BG, "700", "middle")
+        b += t(x + w / 2, y + 74, title, 14, TXT, "600", "middle")
+        b += t(x + w / 2, y + 100, sub, 9.5, MUTED, anchor="middle", mono=True)
+        if i < len(steps) - 1:
+            b += arrow(x + w + 1, y + 65, x + w + gap - 1, y + 65)
+    b += f'<path d="M{40 + 7 * (w + gap) + w / 2} {y + 132} V{y + 168} H{40 + 3 * (w + gap) + w / 2} V{y + 134}" fill="none" stroke="{AMBER}" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#a)"/>'
+    b += t(40 + 5 * (w + gap), y + 190, "next floor: back to step 4", 13, AMBER, anchor="middle")
+    b += box(40, 330, 1060, 112, CARD, EDGE, 12)
+    b += t(60, 362, "What the gates enforce", 15, TXT, "700")
+    for i, (lab, c) in enumerate((("one floor open at a time", AMBER), ("base drawings never written", GREY),
+                                  ("every change in work_log", BLUE), ("counts per room must match", GREEN))):
+        b += pill(60 + i * 258, 378, lab, c, 242)
+    b += t(60, 430, "Your answers (floor order, scale, circuit scheme) are asked once, with defaults, and written into the plan.", 13, MUTED)
+    return svg(1140, 466, b, "Floor-by-floor workflow with gates")
+
+
+def heavy_export_flow() -> str:
+    b = t(40, 46, "Heavy DIALux exports: slim them down before working", 26, TXT, "700")
+    b += t(40, 74, "A raw DIALux DWG can hold hundreds of thousands of calculation objects, in metres. Work on a clean, millimetre copy.", 15, MUTED)
+    cards = (("Raw export", "DLX_OBJ, DLX_CALC and DLX_APERT layers, 3D meshes, metres, own origin", RED, "your file"),
+             ("Inspect first", "intake_scan or live_inventory: layers by weight, units, extent. Nothing is changed", BLUE, "read-only"),
+             ("Slim copy", "dxf_sanitize or live_sanitize: strip heavy layers, scale to mm. Dry run, then explicit copy", GREEN, "copy only"),
+             ("Align + import", "dialux_align (two points), dialux_import, verify per room", AMBER, "reviewable"))
+    w, gap, y = 245, 22, 110
+    for i, (h, d, c, tag) in enumerate(cards):
+        x = 40 + i * (w + gap)
+        b += box(x, y, w, 190, CARD, c, 12, 2) + pill(x + 14, y + 14, tag, c, 90) + t(x + 14, y + 66, h, 18, TXT, "700")
+        words, line, lines = d.split(), "", []
+        for wd in words:
+            if len(line) + len(wd) > 27:
+                lines.append(line)
+                line = wd
+            else:
+                line = (line + " " + wd).strip()
+        lines.append(line)
+        for k, ln in enumerate(lines[:5]):
+            b += t(x + 14, y + 92 + k * 22, ln, 14, MUTED)
+        if i < 3:
+            b += arrow(x + w + 2, y + 95, x + w + gap - 2, y + 95)
+    b += t(40, 340, "The source file is hashed before and after: a sanitise never edits it, and refuses to overwrite a registered base.", 14, MUTED)
+    b += t(40, 364, "Status: built and tested on synthetic exports; not yet run on a real DIALux export.", 13, GREY)
+    return svg(1140, 392, b, "Handling heavy DIALux exports")
+
+
 def roadmap() -> str:
     rows = (("1", "Understand the building (CAD)", "Built", "reads rooms, layers, units; never edits the reference"),
             ("2", "Load identification", "Partly", "Excel load schedule + checks; you supply the loads"),
             ("3", "Lighting design", "Built", "DIALux import, alignment, lighting schedule (lux stays in DIALux)"),
-            ("4", "Socket outlet design", "Partly", "placement, circuits, routes, drawings; no socket load schedule yet"),
+            ("4", "Socket outlet design", "Partly", "placement table, per-room verify, circuits, routes; no socket load schedule"),
             ("5", "Maximum demand", "Partly", "connected + demand kW from YOUR factors; incomplete is flagged"),
             ("6", "Transformer selection", "Not yet", ""),
             ("7", "Generator selection", "Not yet", "essential-load total only"),
             ("8", "Three-phase distribution design", "Partly", "boards and circuits in the drawing; no phase balancing"),
-            ("9", "Cable sizing", "Partly", "Excel inputs + visible formulas; no calculation tool"),
+            ("9", "Cable sizing", "Partly", "circuit lengths (x1.1) + Excel inputs and formulas; no sizing tool"),
             ("10", "Protection design", "Partly", "device column and Ib ≤ In ≤ Iz check in the sheet"),
             ("11", "Single line diagram", "Not yet", ""),
-            ("12", "BOQ and cost estimate", "Not yet", "device counts per floor are available"),
+            ("12", "BOQ and cost estimate", "Partly", "device and length quantities exported to Excel; no pricing"),
             ("13", "Final report", "Not yet", ""))
     col = {"Built": GREEN, "Partly": AMBER, "Not yet": GREY}
     b = t(40, 46, "Your work plan: what the MCP covers today", 26, TXT, "700")
@@ -178,7 +242,8 @@ def roadmap() -> str:
 def main() -> None:
     IMG.mkdir(parents=True, exist_ok=True)
     for name, fn in (("banner", banner), ("architecture", architecture), ("workflow-plan-first", plan_flow),
-                     ("workflow-live", live_flow), ("roadmap", roadmap)):
+                     ("workflow-live", live_flow), ("workflow-floor-set", floor_set_flow),
+                     ("workflow-heavy-export", heavy_export_flow), ("roadmap", roadmap)):
         (IMG / f"{name}.svg").write_text(fn(), encoding="utf-8")
         print("wrote", IMG / f"{name}.svg")
 

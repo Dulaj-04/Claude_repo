@@ -13,13 +13,27 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import __version__, dialux, export, inspection, planner, template, validate, workbook
+from . import (
+    __version__,
+    dialux,
+    export,
+    inspection,
+    intake,
+    planner,
+    sanitize,
+    tables,
+    template,
+    validate,
+    workbook,
+)
 from . import plan as plans
 from .backends import autocad_backend
 from .backends.base import BackendError
+from .bases import BaseRegistry
 from .config import Config, safe_name
 from .live import LiveSession, RealCom
 from .model import Store, sha256_file
+from .oplog import OpLog
 from .schematic import Schematic
 from .template import VIEWS
 
@@ -28,6 +42,8 @@ logging.getLogger("ezdxf").setLevel(logging.ERROR)  # quiet stderr (stdio transp
 CFG = Config.from_env()
 STORE = Store(CFG.workspace)
 PLANS = plans.PlanStore(CFG.workspace)
+BASES = BaseRegistry(CFG.workspace)
+OPS = OpLog(CFG.workspace, lambda: PLANS.active())
 
 INSTRUCTIONS = """\
 Tools to plan, create, revise, validate and export electrical floor drawings and the inputs behind
@@ -49,6 +65,18 @@ WORK PLAN-FIRST (important)
    a result when a step finishes, plan_note for assumptions and decisions. End each reply with the
    short progress line and what you need next from the user.
 5. Small, single-action requests (one placement, one inspection) need no plan.
+6. ASK FIRST, SHORTLY: put questions in a short list, each with a recommended default, so the user can
+   answer "defaults" or a letter. Wait for the answer before drawing. Never assume the same layout
+   for different rooms: each room's contents come from its use and from the user's tables.
+7. ONE FLOOR AT A TIME: draw the first floor, show a preview and the match table (verify_placement),
+   list what is still open, and wait. plan_confirm_floor only after the user says it is right; then
+   the next floor. If the user says stop, stop at the next safe point and report what was drawn.
+8. BASE DRAWINGS ARE NEVER WRITTEN TO: base_register them, make a working copy per floor with
+   floor_from_base, and draw there. Heavy DIALux exports: intake_scan, then sanitise a COPY
+   (dxf_sanitize / live_sanitize); never work on the raw export.
+9. KEEP THE USER INFORMED: say what you are drawing, what changed and where (work_log), what is
+   still open (plan_show.still_open), and use plan_impact before changing a decided value. Don't
+   create extra files or formats that were not asked for. After an interruption: live_resync.
 
 Offline drawing flow: prepare_floor_model -> plan_devices / propose_lighting_grid /
 set_circuit_assignment / plan_routes (each returns a changeset) -> preview_changes -> apply_changes ->
@@ -233,7 +261,7 @@ def apply_changes(
     """Apply a changeset: guarded by model revision, reference hash and manual-edit detection;
     snapshots the previous revision (undo_last), regenerates all four DXF views and reads them
     back for validation."""
-    _gate("apply_changes")
+    _gate("apply_changes", floor)
     m = _model(project, floor)
     cs = STORE.load_changeset(project, floor, changeset_id)
     out_dir = STORE.output_dir(project, floor)
@@ -562,17 +590,20 @@ def plan_templates() -> dict[str, Any]:
 @mcp.tool()
 def plan_define(project: str, title: str, goal: str, success_criteria: list[str],
                 scope_in: list[str] | None = None, scope_out: list[str] | None = None,
-                template: str | None = None, replace: bool = False) -> dict[str, Any]:
+                template: str | None = None, replace: bool = False,
+                floors: list[str] | None = None) -> dict[str, Any]:
     """Start a plan for a large request BEFORE doing any work: a title, a one-paragraph goal, the
     success criteria ('done when...'), what is in and out of scope, and optionally a template that
     pre-fills the steps and the inputs needed from the user. The plan starts as a draft: show it to
-    the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan."""
+    the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan.
+    floors = the floors to draw (e.g. ["GF","1F"]): drawing is then allowed on ONE approved floor at a
+    time (plan_approve_floor), and the next floor only after the user confirmed the previous one."""
     safe_name(project, "project")
     if PLANS.exists(project) and not replace:
         raise ValueError(f"A plan already exists for {project!r}. Call plan_show, or pass "
                          "replace=true to start over.")
     plan = _plan_call(plans.define, project, title, goal, success_criteria, scope_in, scope_out,
-                      template)
+                      template, floors)
     PLANS.save(plan)
     PLANS.set_active(project)
     out = plans.summary(plan)
@@ -666,10 +697,12 @@ def plan_add_input(project: str, input_id: str, title: str, why: str, how: str,
 
 
 @mcp.tool()
-def plan_note(project: str, text: str, kind: Literal["assumption", "decision", "note"] = "assumption",
+def plan_note(project: str, text: str, kind: Literal["assumption", "decision", "note", "open"] = "assumption",
               source: str | None = None) -> dict[str, Any]:
     """Record an assumption, a decision or a note with its source (who/what it came from), so it
-    is visible in the plan and in the report. Use it for every number or choice the user gave you."""
+    is visible in the plan and in the report. Use it for every number or choice the user gave you.
+    kind='open' records something still unresolved (e.g. a symbol overlap not fixed yet): it stays
+    in still_open until plan_resolve."""
     plan = _pl(project)
     n = plans.note(plan, text, kind, source)
     PLANS.save(plan)
@@ -679,7 +712,7 @@ def plan_note(project: str, text: str, kind: Literal["assumption", "decision", "
 # --------------------------------------------------------------------------- Excel inputs
 @mcp.tool()
 def workbook_create(project: str, kind: Literal[
-        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs"],
+        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs", "placement_table"],
         overwrite: bool = False) -> dict[str, Any]:
     """Create an Excel input sheet for the user to fill in (instructions sheet, 'Data' sheet with
     required columns marked *, dropdowns and visible formulas). Saved under
@@ -690,7 +723,7 @@ def workbook_create(project: str, kind: Literal[
 
 @mcp.tool()
 def workbook_read(project: str, kind: Literal[
-        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs"],
+        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs", "placement_table"],
         path: str | None = None, plan_input_id: str | None = None) -> dict[str, Any]:
     """Read and validate a filled-in sheet (default: the project's inputs/<kind>.xlsx): missing
     required fields, bad numbers, factors outside 0-1, unknown categories, duplicate ids. Returns
@@ -771,6 +804,8 @@ def _live() -> LiveSession:
     global _LIVE
     if _LIVE is None:
         _LIVE = LiveSession(RealCom(), CFG.workspace / "live")
+    _LIVE.is_protected = BASES.is_protected  # base drawings are never written to
+    _LIVE.oplog = OPS.append
     return _LIVE
 
 
@@ -785,24 +820,21 @@ def _guard(fn, *a, **kw):
         raise ValueError(f"AutoCAD call failed: {type(exc).__name__}: {exc}") from exc
 
 
-def _gate(what: str) -> None:
-    """Strict mode (ACAD_MCP_REQUIRE_PLAN=1): drawing-changing tools need an approved plan goal."""
+def _gate(what: str, floor: str | None = None) -> None:
+    """Strict mode (ACAD_MCP_REQUIRE_PLAN=1): drawing-changing tools need an approved plan goal and,
+    when the plan lists floors, an approved and unconfirmed floor (one floor at a time)."""
     if not CFG.require_plan:
         return
     project = PLANS.active()
-    ok = False
-    if project and PLANS.exists(project):
-        ok = PLANS.load(project)["goal"]["approved"]
-    if not ok:
-        raise ValueError(
-            f"{what} is blocked: this server requires an approved plan before it changes drawings "
-            "(ACAD_MCP_REQUIRE_PLAN=1). Define the goal with plan_define, show it to the user and "
-            "call plan_approve after they agree.")
+    plan = PLANS.load(project) if project and PLANS.exists(project) else None
+    reason = plans.gate_check(plan, floor)
+    if reason:
+        raise ValueError(f"{what} is blocked: {reason} (strict mode, ACAD_MCP_REQUIRE_PLAN=1)")
 
 
-def _plan(write: bool = True) -> LiveSession:
+def _plan(write: bool = True, floor: str | None = None) -> LiveSession:
     if write:
-        _gate("Changing the open drawing")
+        _gate("Changing the open drawing", floor)
     live = _live()
     if live.mode != "plan":
         raise ValueError("Schematic mode is on, so plan-level drawing tools are disabled. Use the "
@@ -929,7 +961,7 @@ def live_place(
     """LIVE: draw a device symbol (reference style, correct layer) at x,y in the open drawing now.
     Same type at the same spot is not duplicated. One undo step."""
     safe_name(floor, "floor")
-    return _guard(lambda: _plan().place(floor, type, x, y, rotation, circuit, db, room))
+    return _guard(lambda: _plan(floor=floor).place(floor, type, x, y, rotation, circuit, db, room))
 
 
 @mcp.tool()
@@ -939,16 +971,17 @@ def live_import_luminaires(
     scale: float = 1.0, transform: dict[str, float] | None = None,
     type_map: dict[str, str] | None = None, luminaire_list: str | None = None,
     watts_by_type: dict[str, float] | None = None, circuit: str | None = None,
-    dry_run: bool = True,
+    dry_run: bool = True, offset: int = 0, limit: int | None = None,
 ) -> dict[str, Any]:
     """LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing, as one
-    undo step. Same parameters as dialux_import. dry_run=true (default) only reports what would be
+    undo step. offset/limit draw a batch at a time (report 'remaining'; check in with the user
+    between batches). Same parameters as dialux_import. dry_run=true (default) only reports what would be
     drawn (counts per block, first positions); call again with dry_run=false to draw. Already placed
     luminaires at the same spot are skipped."""
     safe_name(floor, "floor")
 
     def run():
-        live = _plan(write=not dry_run)
+        live = _plan(write=not dry_run, floor=floor)
         t = _transform(dx, dy, rotation, scale, transform)
         found = dialux.extract(path, block_names, layers, include_nested, t)
         if not found:
@@ -963,10 +996,12 @@ def live_import_luminaires(
                   "first_positions": [[d["x"], d["y"]] for d in devs[:10]]}
         if dry_run:
             return {"dry_run": True, **report, "next": "call again with dry_run=false to draw"}
+        batch = devs[offset: offset + limit] if limit else devs[offset:]
+        report["remaining_after_this_batch"] = max(len(devs) - offset - len(batch), 0)
         items = [{"type": d["type"], "x": d["x"], "y": d["y"], "rotation": d["rotation"],
                   "circuit": d["circuit"],
                   "extra": {k: d[k] for k in ("luminaire_type", "watts", "lumens", "source")
-                            if d.get(k) is not None}} for d in devs]
+                            if d.get(k) is not None}} for d in batch]
         return {"dry_run": False, **report, **live.place_many(floor, items)}
 
     return _guard(run)
@@ -1029,6 +1064,328 @@ def live_save(path: str | None = None) -> dict[str, Any]:
     """LIVE: save the open drawing (or Save As to path)."""
     return _guard(lambda: _live().save(path))
 
+
+
+# --------------------------------------------------------------------------- floor gates and impact
+@mcp.tool()
+def plan_approve_floor(project: str, floor: str, user_confirmed: bool, note: str | None = None,
+                       force: bool = False) -> dict[str, Any]:
+    """Open ONE floor for drawing after the user said yes to starting it. Only one floor is open at
+    a time: the previous floor must first be confirmed by the user (plan_confirm_floor), or pass
+    force=true to work on several. In strict mode drawing tools refuse for floors that are not open."""
+    if not user_confirmed:
+        raise ValueError("Ask the user whether to start this floor; call with user_confirmed=true "
+                         "only after they say yes.")
+    plan = _pl(project)
+    _plan_call(plans.approve_floor, plan, safe_name(floor, "floor"), note, force)
+    PLANS.save(plan)
+    PLANS.set_active(project)
+    return plans.summary(plan)
+
+
+@mcp.tool()
+def plan_confirm_floor(project: str, floor: str, user_confirmed: bool, note: str | None = None
+                       ) -> dict[str, Any]:
+    """Record that the USER checked the floor and accepts it. Only after this can the next floor be
+    opened, and the floor is locked against further drawing until re-opened. Show a preview first
+    (get_preview_image or live_zoom) and ask; never confirm on your own."""
+    if not user_confirmed:
+        raise ValueError("Show the floor, ask the user to check it, then call with user_confirmed=true.")
+    plan = _pl(project)
+    _plan_call(plans.confirm_floor, plan, floor, note)
+    PLANS.save(plan)
+    return plans.summary(plan)
+
+
+@mcp.tool()
+def plan_resolve(project: str, number: int, how: str | None = None) -> dict[str, Any]:
+    """Mark an open item (plan_note kind='open'; numbers are in still_open) as resolved."""
+    plan = _pl(project)
+    item = _plan_call(plans.resolve_open_item, plan, number, how)
+    PLANS.save(plan)
+    return {"resolved": item, "still_open": plans.still_open(plan)}
+
+
+@mcp.tool()
+def plan_impact(change: str) -> dict[str, Any]:
+    """What a change affects downstream, so you can tell the user BEFORE changing anything. Examples:
+    demand_factors, luminaires, circuits, routes, cable_lengths, loads, transformer, architecture.
+    Shows e.g. that demand factors change cable sizes, SLD, BOQ and report but not the CAD drawings."""
+    return _plan_call(plans.impact_of, change)
+
+
+# --------------------------------------------------------------------------- base drawings, intake
+@mcp.tool()
+def base_register(path: str, role: str = "base") -> dict[str, Any]:
+    """Protect a drawing (architectural base, template) so the MCP never writes to it: live tools
+    refuse while it is the active drawing and live_save refuses to save over it. Records its hash."""
+    return _guard(lambda: BASES.register(path, role))
+
+
+@mcp.tool()
+def base_check() -> dict[str, Any]:
+    """Prove the registered base drawings are unchanged (hash comparison); lists any that changed
+    or went missing."""
+    return _guard(BASES.check)
+
+
+@mcp.tool()
+def floor_from_base(base_path: str, floor: str, dest_dir: str, name: str | None = None,
+                    overwrite: bool = False) -> dict[str, Any]:
+    """Copy a base drawing to a new working file for one floor (default name <floor>_<base name>).
+    The base is registered as protected and only read. Open the copy in AutoCAD and draw there."""
+    return _guard(lambda: BASES.copy_for_floor(base_path, floor, dest_dir, name, overwrite))
+
+
+@mcp.tool()
+def intake_scan(folder: str, expected_floors: list[str] | None = None) -> dict[str, Any]:
+    """Inventory a folder of project inputs on this PC (read-only): every drawing, workbook, PDF,
+    image and DIALux file with its kind, floor, size, hash and (for DXF) units, extents and layers.
+    Reports floors missing from a set, duplicate files, floors whose scale or units disagree, heavy
+    DIALux layers and files that cannot be imported. Run this first on a new project folder."""
+    return _guard(lambda: intake.scan(folder, expected_floors))
+
+
+@mcp.tool()
+def dxf_sanitize(source: str, destination: str, strip_layers: list[str],
+                 scale: float | None = None, from_units: Literal["m", "cm", "inch", "mm"] | None = None,
+                 overwrite: bool = False) -> dict[str, Any]:
+    """Make a slim working copy of a heavy DXF (e.g. a raw DIALux export): erase layers such as
+    DLX_OBJ, DLX_CALC, DLX_APERT and optionally scale to millimetres (from_units='m' multiplies by
+    1000). The source is only read and its hash is checked afterwards; the destination may not be a
+    registered base file. For a DWG use live_sanitize in AutoCAD, or save it as DXF first."""
+    return _guard(lambda: sanitize.sanitize_dxf(source, destination, strip_layers, scale, from_units,
+                                                overwrite, BASES.is_protected))
+
+
+# --------------------------------------------------------------------------- tables: place, verify, lengths
+@mcp.tool()
+def place_from_table(project: str, floor: str, path: str, offset: int = 0, limit: int | None = None,
+                     allow_identical: bool = False, tolerance: float = 0.01) -> dict[str, Any]:
+    """Build a CHANGESET from a filled placement_table workbook (workbook_create kind=placement_table):
+    one row per device with room, type, X, Y, circuit. Refuses rooms that all got identical device
+    mixes without a note (a copied template) unless allow_identical=true. offset/limit do a batch at a
+    time and report what remains. Repeats create no duplicates. Nothing is drawn until apply_changes."""
+    m = _model(project, floor)
+
+    def run():
+        rows = tables.rows_for_floor(path, floor)
+        same = tables.identical_rooms(rows)
+        if same and not allow_identical:
+            raise ValueError(f"Rooms with identical device lists and no notes: {same}. Each room "
+                             "should come from its own use; add a note on the rows if this is "
+                             "intended, or pass allow_identical=true.")
+        specs, info = tables.specs_from_rows(m, rows)
+        batch = specs[offset: offset + limit] if limit else specs[offset:]
+        cs = planner.plan_devices(m, batch, None, tolerance)
+        cs["label"] = "place_from_table"
+        if info["unknown_rooms"]:
+            cs["assumptions"].append(f"Rooms not in the floor model: {info['unknown_rooms']}.")
+        if info["outside_their_room"]:
+            cs["assumptions"].append(f"{info['outside_their_room']} device(s) lie outside their room's bounds.")
+        STORE.save_changeset(cs)
+        return {**planner.describe(cs, m), "table_rows_for_floor": len(rows), "rows_in_this_batch": len(batch),
+                "remaining_after_this_batch": max(len(specs) - offset - len(batch), 0), **info}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def verify_placement(project: str, floor: str, path: str) -> dict[str, Any]:
+    """Compare the floor model with the placement table: expected vs actual device count for every
+    room and type, with a list of mismatches. Run after applying and before showing the floor."""
+    m = _model(project, floor)
+
+    def run():
+        rows = tables.rows_for_floor(path, floor)
+        res = tables.compare_counts(rows, m["devices"], m)
+        return {**res, "floor": floor, "model_revision": m["revision"], "table": path}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def export_circuit_lengths(project: str, floor: str, factor: float = 1.1,
+                           unit_to_m: float | None = None) -> dict[str, Any]:
+    """Circuit lengths from the routes in the floor model, as a workbook range for cable sizing and
+    the BOQ (<workspace>/<project>/output/<floor>/circuit_lengths.xlsx, named range
+    Circuit_Lengths_<floor>). factor = ceiling-route allowance (default 1.1). unit_to_m = metres per
+    drawing unit if the model's units are not known. Circuits without a route are listed."""
+    m = _model(project, floor)
+
+    def run():
+        res = tables.circuit_lengths(m, factor, unit_to_m)
+        out = STORE.output_dir(project, floor) / "circuit_lengths.xlsx"
+        headers = ["Circuit", "Floor", "DB", "Kind", "Devices", "Route length (m)",
+                   f"Length x{factor} (m)", "Source"]
+        body = [[r["circuit"], r["floor"], r["db"], r["kind"], r["devices"], r["route_length_m"],
+                 r["length_m_with_factor"], r["source"]] for r in res["rows"]]
+        ref = tables.write_xlsx(out, "Lengths", headers, body, f"Circuit_Lengths_{floor}")
+        return {**res, "file": str(out), "named_range": f"Circuit_Lengths_{floor}", "range": ref}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def export_quantities(project: str, floors: list[str] | None = None) -> dict[str, Any]:
+    """Counts per floor, device type and luminaire type from the floor models, as a workbook range
+    (<workspace>/<project>/output/quantities.xlsx, named range Quantities) for the BOQ and report."""
+    def run():
+        names = floors or sorted(p.parent.name for p in (CFG.workspace / safe_name(project, "project"))
+                                 .glob("*/model.json"))
+        models = [_model(project, f) for f in names]
+        rows = tables.quantities(models)
+        out = CFG.workspace / project / "output" / "quantities.xlsx"
+        ref = tables.write_xlsx(out, "Quantities", ["Floor", "Item", "Detail", "Qty", "Unit"],
+                                [[r["floor"], r["item"], r["detail"], r["qty"], r["unit"]] for r in rows],
+                                "Quantities")
+        return {"floors": names, "rows": len(rows), "file": str(out), "named_range": "Quantities",
+                "range": ref}
+
+    return _guard(run)
+
+
+# --------------------------------------------------------------------------- live: tables, inventory, recovery
+@mcp.tool()
+def live_place_from_table(floor: str, path: str, offset: int = 0, limit: int | None = 40,
+                          dry_run: bool = True, allow_identical: bool = False) -> dict[str, Any]:
+    """LIVE: draw devices from a filled placement_table into the OPEN drawing, as one undo step.
+    Dry run by default. limit (default 40) draws a batch at a time: tell the user what was drawn and
+    ask before the next batch (remaining is reported). Same refusal of copied-identical rooms as
+    place_from_table. Already placed devices at the same spot are skipped."""
+    safe_name(floor, "floor")
+
+    def run():
+        live = _plan(write=not dry_run, floor=floor)
+        rows = tables.rows_for_floor(path, floor)
+        same = tables.identical_rooms(rows)
+        if same and not allow_identical:
+            raise ValueError(f"Rooms with identical device lists and no notes: {same}. Add a note on "
+                             "the rows if intended, or pass allow_identical=true.")
+        batch = rows[offset: offset + limit] if limit else rows[offset:]
+        remaining = max(len(rows) - offset - len(batch), 0)
+        by_type = dict(Counter(r["type"] for r in batch))
+        if dry_run:
+            return {"dry_run": True, "rows_for_floor": len(rows), "this_batch": len(batch),
+                    "by_type": by_type, "remaining_after_this_batch": remaining,
+                    "next": "call again with dry_run=false to draw this batch"}
+        items = [{"type": r["type"], "x": r["x"], "y": r["y"], "rotation": r.get("rotation") or 0.0,
+                  "circuit": r.get("circuit"), "db": r.get("db"), "room": str(r["room"]),
+                  "extra": {k: r[k] for k in ("label",) if r.get(k)}} for r in batch]
+        return {"dry_run": False, "by_type": by_type, "remaining_after_this_batch": remaining,
+                **live.place_many(floor, items)}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def live_verify_placement(floor: str, path: str) -> dict[str, Any]:
+    """LIVE: compare the devices tracked in the open drawing with the placement table: expected vs
+    actual per room and type, with mismatches. Run before showing the floor to the user."""
+    def run():
+        rows = tables.rows_for_floor(path, floor)
+        devs = _live().list_devices()["devices"]
+        return {**tables.compare_counts(rows, devs, None), "floor": floor, "table": path}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def live_circuit_lengths(factor: float = 1.1, unit_to_m: float | None = None,
+                         export_project: str | None = None) -> dict[str, Any]:
+    """LIVE: route lengths per circuit from the routes drawn in the open drawing (x factor for the
+    ceiling route). Lists circuits with no route and routes made stale by a moved device. Pass
+    export_project to also write <workspace>/<project>/output/live_circuit_lengths.xlsx with a
+    named range for cable sizing."""
+    def run():
+        res = _live().circuit_lengths(factor, unit_to_m)
+        if export_project:
+            out = CFG.workspace / safe_name(export_project, "project") / "output" / "live_circuit_lengths.xlsx"
+            body = [[r["circuit"], r["kind"], r["db"], r["devices"], r["route_length_m"],
+                     r["length_m_with_factor"], "stale" if r["stale"] else "ok"] for r in res["rows"]]
+            res["file"] = str(out)
+            res["range"] = tables.write_xlsx(out, "Lengths", ["Circuit", "Kind", "DB", "Devices",
+                                             "Route length (m)", f"Length x{factor} (m)", "Route"], body,
+                                             "Circuit_Lengths_Live")
+        return res
+
+    return _guard(run)
+
+
+@mcp.tool()
+def live_inventory(top_layers: int = 6) -> dict[str, Any]:
+    """LIVE: fast census of the open drawing, safe for huge DIALux exports (counts come from AutoCAD
+    itself): entities per layer, types on the biggest layers, block definitions, units, extents,
+    and warnings about heavy DIALux layers. Run on an unfamiliar drawing before anything else."""
+    return _guard(lambda: _live().inventory(top_layers))
+
+
+@mcp.tool()
+def live_sanitize(strip_layers: list[str], scale: float | None = None, set_units_mm: bool = True,
+                  dry_run: bool = True, confirm_copy: bool = False) -> dict[str, Any]:
+    """LIVE: in the OPEN drawing, erase heavy layers (e.g. DLX_OBJ, DLX_CALC, DLX_APERT) and optionally
+    scale (1000 for metres to millimetres). Runs inside AutoCAD so it is fast. Refuses a registered
+    base drawing; the real run needs dry_run=false AND confirm_copy=true (it must be a working copy).
+    Locked layers cannot be erased. Untested on real AutoCAD: try on a throwaway copy first."""
+    def run():
+        live = _plan(write=not dry_run)
+        return live.sanitize(strip_layers, scale, set_units_mm, dry_run, confirm_copy)
+
+    return _guard(run)
+
+
+@mcp.tool()
+def live_resync(prune: bool = False) -> dict[str, Any]:
+    """LIVE: after a dropped connection or a crash: compare what the tools tracked with what is
+    really in the open drawing (missing, untracked), and optionally forget entries that are gone."""
+    return _guard(lambda: _live().resync(prune))
+
+
+@mcp.tool()
+def work_log(limit: int = 30) -> dict[str, Any]:
+    """What the drawing tools did, newest last (placed, moved, routed, sanitised, saved), plus the
+    plan's still-open list. Use it to resume after an interruption and to report what changed."""
+    project = PLANS.active()
+    out: dict[str, Any] = {"project": project, "entries": OPS.tail(limit)}
+    if project and PLANS.exists(project):
+        out["still_open"] = plans.still_open(PLANS.load(project))
+    return out
+
+
+@mcp.prompt()
+def start_project(project: str, folder: str) -> str:
+    """Begin a multi-floor project: inventory the inputs, then plan and ask."""
+    return (f"Project {project}: inputs are in {folder}. Run intake_scan on it and tell me what you found, "
+            "what is missing and anything that looks wrong (units, scale, duplicates, heavy DIALux "
+            "files). Then use plan_define with template 'floor_set_workflow' (list the floors), show me the "
+            "goal and ask your questions in short form, each with a default I can accept by saying "
+            "'defaults'. Do not draw anything before I approve.")
+
+
+@mcp.prompt()
+def new_floor(project: str, floor: str) -> str:
+    """Do one floor, then stop for the user's check."""
+    return (f"Project {project}, floor {floor}. Check plan_show first. Ask your short questions with defaults "
+            "if any are open. After I answer, plan_approve_floor, make a working copy with floor_from_base "
+            "(never draw in a base file), then do this floor only: lighting, loads from the tables, routes, "
+            "verify_placement. Show me a preview and the match table, list what is still open, and wait. "
+            "Do not start the next floor until I confirm this one (plan_confirm_floor).")
+
+
+@mcp.prompt()
+def finish_floor_set(project: str) -> str:
+    """Wrap up all floors: lengths, quantities, open items."""
+    return (f"Project {project}: all floors are confirmed. Export circuit lengths and quantities, run "
+            "base_check to prove the base drawings are untouched, and give me the still-open list and "
+            "what changed where. Use plan_impact to tell me which outputs depend on anything I change next.")
+
+
+@mcp.prompt()
+def plain_language() -> str:
+    """Ask for simple wording and short answers."""
+    return ("From now on: plain words, no jargon unless I ask (explain any code you must use in one line), "
+            "short replies, tables over paragraphs, and a preview with each drawing. Ask before using a "
+            "technical term, and never create files or formats I did not ask for.")
 
 # --------------------------------------------------------------------------- CLI
 def _selftest() -> int:

@@ -13,14 +13,11 @@ round trip, chunked), because SendCommand itself returns nothing.
 from __future__ import annotations
 
 import re
-import time
 from typing import Any
 
 from .backends.base import BackendError
 from .live import LiveSession
 
-CHUNK = 440
-MAX_RESULT = 30000
 # attribute names AutoCAD Electrical uses on components (reading is tolerant of others)
 COMPONENT_ATTRS = ("TAG1", "TAG2", "TAGSTRIP", "DESC1", "DESC2", "DESC3", "INST", "LOC", "MFG",
                    "CAT", "ASSYCODE", "RATING1", "RATING2", "RATING3", "WDBLKNAM")
@@ -34,42 +31,7 @@ class Schematic:
     # ------------------------------------------------------------------ AutoLISP bridge
     def lisp(self, expr: str, timeout: float = 20.0) -> str:
         """Evaluate an AutoLISP expression in the active drawing and return its printed value."""
-        live, c = self.live, self.live.com.call
-        doc = live.doc
-
-        def run(cmd: str) -> str:
-            c(lambda: doc.SetVariable("USERS1", ""))
-            c(lambda: doc.SendCommand(cmd + "\n"))
-            end = time.time() + timeout
-            while time.time() < end:
-                val = str(c(lambda: doc.GetVariable("USERS1")))
-                if val:
-                    return val
-                time.sleep(0.15)
-            raise BackendError(
-                "AutoCAD did not answer the AutoLISP request in time. It may be busy or inside "
-                "a command/dialog: press Esc in AutoCAD and try again.")
-
-        first = run(
-            '(progn (setq *acm-r* (vl-catch-all-apply (quote (lambda () (vl-princ-to-string '
-            + expr + '))))) (if (vl-catch-all-error-p *acm-r*) (setq *acm-r* (strcat "LISP ERROR: "'
-            ' (vl-catch-all-error-message *acm-r*)))) '
-            f'(setvar "USERS1" (strcat "OK:" (substr *acm-r* 1 {CHUNK}))) (princ))')
-        out = first[3:] if first.startswith("OK:") else first
-        pos = CHUNK + 1
-        while len(out) == pos - 1 and len(out) < MAX_RESULT:
-            nxt = run(f'(progn (setvar "USERS1" (strcat "OK:" (substr *acm-r* {pos} {CHUNK}))) '
-                      '(princ))')
-            nxt = nxt[3:] if nxt.startswith("OK:") else nxt
-            if not nxt:
-                break
-            out += nxt
-            pos += CHUNK
-            if len(nxt) < CHUNK:
-                break
-        if out.startswith("LISP ERROR"):
-            raise BackendError(out)
-        return out
+        return self.live.lisp(expr, timeout)
 
     # ------------------------------------------------------------------ reading
     def _block_refs(self) -> list[dict[str, Any]]:

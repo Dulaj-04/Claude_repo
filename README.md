@@ -36,6 +36,12 @@
 | **Excel input sheets** | Sheets for the load schedule, lighting requirements, luminaire list and cable inputs, with checks that name the row and column of every mistake. Connected load and maximum demand from your factors. |
 | **Drawing packages** | Four views per floor from one model (architectural, lighting, power/sockets/AC, combined) exported to DXF, PNG, A3 PDF and a manifest. |
 | **Checks** | Unique ids, circuits on the right board, routes tied to circuits, devices inside rooms, units and scale warnings, hand edits detected. |
+| **Floor-by-floor gates** | For a multi-floor project only **one floor is open at a time**. A floor is drawn, checked against its count table, and confirmed by you before the next one opens. Questions (floor order, scale, circuit scheme) are asked once, with defaults. |
+| **Protected base drawings** | Architectural bases and templates are hashed and **never written**: live edits and saves are refused on them, each floor is drawn in a copy, and `base_check` proves the originals are unchanged. |
+| **Heavy DIALux exports** | `intake_scan` and `live_inventory` look before touching; `dxf_sanitize` / `live_sanitize` strip DIALux calculation layers and rescale metres to millimetres in a **copy**. |
+| **Placement tables** | Devices are placed from an Excel table (room, type, X, Y, circuit) in batches, then `verify_placement` compares expected and actual counts per room and type. |
+| **Lengths and quantities** | Circuit lengths (route length × ceiling factor) and device/luminaire counts are exported to Excel as named ranges for cable sizing and the BOQ. |
+| **Recovery** | `work_log` records every drawing change; `live_resync` reconciles tracked devices with what is really in the drawing after a crash or reconnect. |
 | **Schematic mode** (optional) | Reads AutoCAD Electrical schematics (components, tags, wire numbers) and probes your install. Writing schematics is not built yet. |
 
 ## See it in action
@@ -70,6 +76,10 @@ The lighting schedule that results (sample wattages from a luminaire list; insta
 The assistant creates the sheet, tells you what to enter, then reads it back and checks it. Grey columns are visible Excel formulas; required columns are marked `*`.
 
 ![The load schedule workbook with sample loads](docs/images/demo-load-schedule.png)
+
+Placement uses the same idea: the assistant creates a **placement table**, you (or it, from your instructions) list one device per row, and nothing is drawn until the table passes its checks. Rooms that all received identical device lists are refused as a probable copied template, unless you say it is intended.
+
+![The placement table workbook with sample devices for two rooms](docs/images/demo-placement-table.png)
 
 From that sample, `load_summary` reports (and refuses to hide the gap): connected **211.58 kW**, demand **207.96 kW**, essential **200.5 kW**, and `complete: false` because the fire alarm panel (`1F-FIRE`) has **no demand factor**, so it is left out of the demand total, never assumed to be 1.
 
@@ -121,7 +131,28 @@ Ready-made plan templates: **lighting from DIALux**, **load schedule and maximum
 
 Guard rails: a scale/units check, a count of luminaires outside every room, and a list of types without wattage. Guide: [docs/dialux.md](docs/dialux.md).
 
-### 3. Live editing in AutoCAD
+### 3. A multi-floor project, one floor at a time
+![Floor workflow: intake, slim the export, working copy, open the floor, fill the table, place and route, verify counts, you confirm](docs/images/workflow-floor-set.svg)
+
+This is the workflow learned from running the server on a real six-floor project. The assistant:
+
+1. **Scans your inputs first** (`intake_scan`): which floors exist, which are missing, duplicate files, floors whose scale disagrees, heavy DIALux layers, DWGs it cannot read.
+2. **Asks everything once, with defaults** (floor order, units, circuit scheme, socket heights) and writes the answers into the plan.
+3. **Never touches a base drawing** (`base_register`, `floor_from_base`); each floor is drawn in its own copy.
+4. **Opens one floor** (`plan_approve_floor`), places devices from a table (`place_from_table` or `live_place_from_table`, in batches with a pause between them), runs `verify_placement`, and shows you the floor.
+5. **Waits for you** (`plan_confirm_floor`) before the next floor can open. Open questions are kept in a list (`plan_note` kind `open`, `plan_resolve`) so none are forgotten.
+6. **Tells you what a change affects** (`plan_impact`): for example a new demand factor changes cable sizes, the SLD, the BOQ and the report, but not the CAD drawings.
+
+Prompts that start these flows: `start_project`, `new_floor`, `finish_floor_set`. `plain_language` makes the assistant describe each step without jargon. Guide: [docs/project-workflow.md](docs/project-workflow.md).
+
+> *Try:* "Start a project for floors GF to 6F. Scan this folder first, tell me what is missing, and ask me what you need before drawing anything."
+
+### 4. Heavy DIALux exports
+![Heavy export flow: raw export, inspect first, slim copy, align and import](docs/images/workflow-heavy-export.svg)
+
+Raw DIALux DWGs can hold hundreds of thousands of calculation objects in metres. `live_inventory` (or `intake_scan` for files on disk) reports what is heavy **without changing anything**; `live_sanitize` / `dxf_sanitize` then make a slim millimetre copy (dry run first, an explicit copy confirmation, the source hash checked afterwards). Then the normal alignment and import apply.
+
+### 5. Live editing in AutoCAD
 ![Live mode: you say it, the tool call runs, AutoCAD draws it, you see it and can undo](docs/images/workflow-live.svg)
 
 An example session:
@@ -141,13 +172,13 @@ Claude  Undone (one step). Moved DB-4F; routes through it are marked stale, redr
 
 Every device is wrapped in a named AutoCAD group `ACADE_<id>`, which survives saving and your own hand edits. Guide: [docs/live.md](docs/live.md).
 
-### 4. Offline drawing package (no AutoCAD needed)
+### 6. Offline drawing package (no AutoCAD needed)
 `prepare_floor_model` → `plan_devices` / `propose_lighting_grid` / `set_circuit_assignment` / `plan_routes` → `preview_changes` → `apply_changes` → `validate_drawing` → `export_package`. The output folder holds a DXF, PNG and PDF per view and a `manifest.json` with file hashes and the validation result. Reference drawings are never modified, and a repeated plan creates no duplicates.
 
-### 5. Loads to maximum demand with Excel
+### 7. Loads to maximum demand with Excel
 `workbook_create` → you fill in `load_schedule.xlsx` → `workbook_read` (row and column of every problem) → `load_summary` → results and assumptions recorded in the plan. Demand factors are yours; missing ones are reported, not defaulted.
 
-### 6. Schematic mode (optional, read-only for now)
+### 8. Schematic mode (optional, read-only for now)
 Say "switch to schematic mode". `sch_detect` reports whether Electrical is loaded (with evidence), `sch_read` lists components, tags and wire numbers, `sch_probe` lists the commands your install exposes. The plan-symbol tools are blocked in this mode so the two are never mixed by accident.
 
 ## Things to try
@@ -166,6 +197,15 @@ Say "switch to schematic mode". `sch_detect` reports whether Electrical is loade
 | "Align the DIALux export using these two points… then import with this luminaire list" | A reviewable changeset with warnings | export + luminaire list + two points |
 | "Create the load schedule workbook and tell me how to fill it in" | Excel sheet with instructions and formulas | nothing |
 | "Check my load schedule and give me connected load and maximum demand" | Row/column errors, then totals from your factors | the filled sheet |
+| "Start a project for floors GF to 6F; scan this folder first" | `intake_scan` inventory, missing floors, scale warnings, questions with defaults | a folder path |
+| "Register the architectural base and make a working copy for 3F" | Hash, protect, copy; the base can never be written | a DWG/DXF base |
+| "Inspect this DIALux drawing before we touch it" | Entities per layer, heavy layers, units (`live_inventory`) | a drawing open |
+| "Slim it down: strip the DLX layers and convert metres to mm" | Dry run, then a cleaned copy (`live_sanitize`, `dxf_sanitize`) | a working copy |
+| "Create the placement table for 3F, I'll fill it" | Excel table with dropdowns and checks | nothing |
+| "Place the table's devices, 40 at a time, then verify" | Batches as single undo steps, then expected vs actual per room | a filled table |
+| "Give me circuit lengths with 10% ceiling allowance, and the quantities" | Excel ranges for cable sizing and BOQ | routes drawn |
+| "What did you change today? Resume where we stopped" | `work_log`, `live_resync` | a previous session |
+| "If I change the demand factors, what is affected?" | `plan_impact` before anything changes | nothing |
 | "Plan the whole project from the work plan" | A roadmap of separate plans with what is automated and what is not | the work plan |
 | "Switch to schematic mode and run `sch_detect`" | Evidence on whether Electrical is loaded; counts of components and wires | AutoCAD Electrical |
 
@@ -178,8 +218,9 @@ Say "switch to schematic mode". `sch_detect` reports whether Electrical is loade
 | Offline workflow, exports, validation, MCP protocol, plan-first, Excel sheets, DIALux logic | Automated tests on Python 3.10 and 3.12 (CI) |
 | Server install, Claude Desktop connection | Confirmed on a Windows PC |
 | `live_selftest` on **AutoCAD Electrical 2026**, AutoLISP link | Confirmed on real AutoCAD |
-| `live_adopt`, `live_delete`, `live_undo`, `live_zoom`, `live_texts`, `live_import_luminaires`, `sch_*` | Tested against a simulated AutoCAD only; try on a scratch copy and report errors |
-| DIALux import | Tested on synthetic DIALux-style exports; **not yet run on a real DIALux export** (send one to tune it) |
+| `live_adopt`, `live_delete`, `live_undo`, `live_zoom`, `live_texts`, `live_import_luminaires`, `live_inventory`, `live_sanitize`, `live_resync`, `live_place_from_table`, `live_verify_placement`, `live_circuit_lengths`, `sch_*` | Tested against a simulated AutoCAD only; try on a scratch copy and report errors |
+| Floor gates, protected bases, `intake_scan`, `dxf_sanitize`, placement tables, verification, lengths and quantities | Automated tests (offline and simulated AutoCAD) |
+| DIALux import | Tested on synthetic DIALux-style exports; **not yet run on a real DIALux export**. The real export folder was not available when the latest features were built, so run `intake_scan` on it and report the output to tune the importer |
 | Schematic insert / wiring / wire numbering / reports | Not built (needs the AutoCAD Electrical API signatures) |
 | Transformer, generator, automated cable sizing and protection, SLD, BOQ | Not built; Excel inputs and formulas exist for cables and protection |
 | Layouts and viewports | Not supported (model space only) |
@@ -208,7 +249,7 @@ Step-by-step with troubleshooting: [docs/windows-setup.md](docs/windows-setup.md
 git clone https://github.com/Dulaj-04/autocad-electrical-mcp.git && cd autocad-electrical-mcp
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -e .
-acad-electrical-mcp --selftest                         # prints "SELFTEST OK ... 63 tools"
+acad-electrical-mcp --selftest                         # prints "SELFTEST OK ... 83 tools"
 acad-electrical-mcp --make-sample sample_floor.dxf     # optional demo drawing
 ```
 Python 3.10+. Output goes to `./acad_mcp_workspace` (change with `ACAD_MCP_WORKSPACE` or `--workspace`).
@@ -243,7 +284,7 @@ Then add `https://abc123.ngrok-free.app/mcp` as a connector (ChatGPT *Settings �
 ## Commands
 
 <details>
-<summary><b>MCP tools (63)</b>: what the assistant can call. Full parameters: <a href="docs/tools.md">docs/tools.md</a> (generated from the running server)</summary>
+<summary><b>MCP tools (83)</b>: what the assistant can call. Full parameters: <a href="docs/tools.md">docs/tools.md</a> (generated from the running server)</summary>
 
 | Group | Tool | What it does |
 | --- | --- | --- |
@@ -253,8 +294,27 @@ Then add `https://abc123.ngrok-free.app/mcp` as a connector (ChatGPT *Settings �
 | | `plan_approve` | Record that you agreed to the goal (only after you said yes). |
 | | `plan_update_step` | Start/finish a step with a result; refused while inputs are missing. |
 | | `plan_provide_input` | Record a file/value/decision you supplied; unblocks the steps that need it. |
-| | `plan_add_step` / `plan_add_input` / `plan_note` | Extend the plan; record assumptions, decisions and their sources. |
-| **Excel inputs** | `workbook_create` | Create an Excel sheet for you to fill in (load schedule, lighting requirements, luminaire list, cable/protection inputs). |
+| | `plan_add_step` / `plan_add_input` / `plan_note` | Extend the plan; record assumptions, decisions, sources and **open items**. |
+| | `plan_resolve` | Close an open item with how it was resolved. |
+| | `plan_impact` | What a change (demand factors, luminaires, circuits, architecture...) affects downstream, before you make it. |
+| **Floor gates** | `plan_approve_floor` | Open ONE floor for drawing after you said yes (the previous one must be confirmed). |
+| | `plan_confirm_floor` | Record that you checked the floor and accept it; locks it and lets the next one open. |
+| **Protected bases** | `base_register` | Protect a base drawing: hashed, never written, saves over it refused. |
+| | `base_check` | Prove the registered bases are unchanged. |
+| | `floor_from_base` | Copy a base to a per-floor working file; the base is only read. |
+| **Intake and heavy exports** | `intake_scan` | Read-only inventory of an input folder: kinds, floors, missing floors, duplicates, scale mismatches, heavy DIALux layers, unreadable DWGs. |
+| | `dxf_sanitize` | Slim, scaled COPY of a heavy DXF (strips DIALux layers, metres to mm); source untouched. |
+| | `live_inventory` | Fast census of the open drawing, safe for huge exports: entities per layer, types, blocks, units, extents. |
+| | `live_sanitize` | Same clean-up inside the open drawing, only on a working copy (dry run, then `confirm_copy`). |
+| **Placement tables** | `place_from_table` | Changeset from a filled placement table, in batches; refuses copied-identical rooms. |
+| | `verify_placement` | Expected vs actual device count per room and type, with a mismatch list. |
+| | `live_place_from_table` / `live_verify_placement` | The same, drawn into / checked against the open drawing (one undo step per batch). |
+| **Lengths and quantities** | `export_circuit_lengths` | Route length per circuit x ceiling factor, to Excel as a named range. |
+| | `export_quantities` | Device and luminaire counts per floor, to Excel as a named range, for the BOQ. |
+| | `live_circuit_lengths` | Route lengths from the open drawing; lists circuits without a route and stale routes. |
+| **Recovery** | `work_log` | What the tools changed, newest last, plus the plan's open list. |
+| | `live_resync` | Reconcile tracked devices with the open drawing after a crash or reconnect. |
+| **Excel inputs** | `workbook_create` | Create an Excel sheet for you to fill in (load schedule, lighting requirements, luminaire list, cable/protection inputs, placement table). |
 | | `workbook_read` | Check the filled-in sheet: missing fields, bad numbers, factors outside 0-1, duplicates (row and column given). |
 | | `load_summary` | Connected load and maximum demand by floor/board/category and essential loads, using only the factors you entered. |
 | **Live editing** (Windows + AutoCAD) | `live_connect` | Attach to the open drawing; report name, layers, entity counts, unit scale. Start here. |
@@ -329,13 +389,14 @@ Then add `https://abc123.ngrok-free.app/mcp` as a connector (ChatGPT *Settings �
 | `ACAD_MCP_REQUIRE_PLAN` | `1` = strict: tools that change drawings refuse until a plan goal is defined and approved. Off by default. |
 | `ACAD_MCP_ALLOW_COMMANDS` | `1` enables `acad_run_command` and `sch_run_lisp`. Off by default because they can change any open drawing. |
 
-Prompts offered to MCP clients: `plan_a_request`, `lighting_from_dialux`, `load_schedule_and_demand`, `project_roadmap`.
+Prompts offered to MCP clients: `plan_a_request`, `lighting_from_dialux`, `load_schedule_and_demand`, `project_roadmap`, `start_project`, `new_floor`, `finish_floor_set`, `plain_language`.
 </details>
 
 ## How it works
 - **Offline:** one JSON *floor model* per floor (rooms, devices, circuits, routes) is the source of truth; all four views are generated from it. Edits are *changesets*: plan → `preview_changes` → `apply_changes`, guarded by model revision, the reference file hash and hand-edit detection, with a snapshot for `undo_last`. Deterministic ids make repeated plans idempotent.
 - **Live:** each device or route is drawn as plain LINE/polyline/TEXT in your reference style on your layers and wrapped in a named AutoCAD group, inside an undo mark. Symbol size comes from the geometry (your reference drawings are millimetres although their header says metres).
 - **Plan-first:** the server tells the assistant to define a goal and get approval before large work, and stores the plan per project (`plan.json`). Strict mode (`ACAD_MCP_REQUIRE_PLAN=1`) makes drawing-changing tools enforce it.
+- **Safety rails:** base drawings are registered by SHA-256 and refused for any write or save; every drawing change is appended to a work log; each instruction is one undo step; a floor cannot be drawn unless it is the one open floor (always in strict mode, `ACAD_MCP_REQUIRE_PLAN=1`; the assistant is also told to follow the same order without it).
 - **Schematic:** reads AutoCAD Electrical blocks and attributes and talks to AutoLISP by sending an expression and reading the answer back through a system variable.
 
 ## Repository layout
@@ -350,7 +411,10 @@ Prompts offered to MCP clients: `plan_a_request`, `lighting_from_dialux`, `load_
 │   ├── live.py                    LIVE editing of the open AutoCAD drawing (COM)
 │   ├── schematic.py               AutoCAD Electrical schematic read + AutoLISP probe
 │   ├── symbols.py                 plan-symbol geometry in your reference style
-│   ├── plan.py  workbook.py       plan-first engine and templates; Excel sheets and load summary
+│   ├── plan.py  workbook.py       plan-first engine, floor gates, templates; Excel sheets and load summary
+│   ├── bases.py  intake.py        protected base drawings; read-only input-folder scan
+│   ├── sanitize.py  tables.py     heavy DXF clean-up; placement table, lengths, quantities
+│   ├── oplog.py                   work log of every drawing change
 │   ├── dialux.py                  DIALux export import, alignment, luminaire list, lighting schedule
 │   ├── planner.py  model.py       changesets and the floor model store (offline)
 │   ├── views.py  export.py        generate the four views; DXF/PNG/PDF/manifest
@@ -366,12 +430,13 @@ Prompts offered to MCP clients: `plan_a_request`, `lighting_from_dialux`, `load_
 ├── docs/
 │   ├── windows-setup.md           install + troubleshooting
 │   ├── planning.md                plan-first workflow, templates, Excel input sheets
+│   ├── project-workflow.md        multi-floor workflow: intake, gates, bases, tables, verify, recovery
 │   ├── dialux.md                  importing a DIALux lighting layout
 │   ├── live.md                    live mode and schematic mode guide
 │   ├── tools.md                   every tool and parameter (generated)
 │   └── images/                    README pictures
 ├── examples/claude_desktop_config.json
-└── tests/                         offline workflow, live (simulated AutoCAD), DIALux, plan/Excel, schematic, docs
+└── tests/                         offline workflow, live (simulated AutoCAD), DIALux, plan/Excel, project workflow, schematic, docs
 ```
 
 ## Troubleshooting
