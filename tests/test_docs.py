@@ -29,7 +29,10 @@ def test_readme_mentions_every_tool():
 
 def test_relative_links_resolve():
     for md in [ROOT / "README.md", *(ROOT / "docs").glob("*.md")]:
-        for target in re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", md.read_text()):
+        text = md.read_text()
+        targets = re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", text) + re.findall(
+            r'(?:src|href)="([^"#]+)(?:#[^"]*)?"', text)
+        for target in targets:
             if target.startswith(("http://", "https://", "mailto:")):
                 continue
             assert (md.parent / target).exists(), f"{md.name}: broken link {target}"

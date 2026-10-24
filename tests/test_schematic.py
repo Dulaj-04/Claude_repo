@@ -60,23 +60,50 @@ def test_lisp_timeout_when_autocad_busy(sch, monkeypatch):
         s.lisp("(x)", timeout=15)
 
 
-def test_probe_and_detect(sch):
+def test_probe(sch):
     s, _, app = sch
-
-    def handler(cmd):
-        if "atoms-family" in cmd:
-            return "C:AEPROJECT,C:AECOMPONENT,C:AEWIRENO,"
-        if "PRODUCT" in cmd:
-            return "AutoCAD Electrical 2026"
-        if "ACADVER" in cmd:
-            return "25.0s"
-        return "yes" if "c:wd_proj" in cmd else "defined"
-    app.ActiveDocument.lisp_handler = handler
+    app.ActiveDocument.lisp_handler = lambda cmd: "C:AEPROJECT,C:AECOMPONENT,C:AEWIRENO,"
     p = s.probe()
     assert p["symbols"] == ["C:AEPROJECT", "C:AECOMPONENT", "C:AEWIRENO"] and not p["truncated"]
+
+
+def _handler(arx, command):
+    def handler(cmd):
+        if "(arx)" in cmd:
+            return arx
+        if "getcname" in cmd:
+            return command
+        return {"PRODUCT": "AutoCAD", "ACADVER": "25.1s"}["PRODUCT" if "PRODUCT" in cmd else "ACADVER"]
+    return handler
+
+
+def test_detect_sees_electrical_modules_even_when_no_lisp_symbol(sch):
+    s, _, app = sch
+    app.ActiveDocument.lisp_handler = _handler("acad.arx,acade.arx,", "yes")
     d = s.detect()
     assert d["lisp_bridge"] == "ok" and d["components"] == 2 and d["looks_like_schematic"]
-    assert d["electrical_loaded"] == "yes"
+    assert d["electrical_loaded"] == "yes" and d["registered_commands"] == {"AEPROJECT": "yes"}
+    assert any("acade.arx" in e for e in d["evidence"])
+
+
+def test_detect_not_loaded_only_when_module_and_command_both_missing(sch):
+    s, _, app = sch
+    app.ActiveDocument.lisp_handler = _handler("acad.arx,acetutil.arx,", "no")
+    app.Caption = "AutoCAD 2026 - [Drawing1.dwg]"
+    d = s.detect()
+    assert d["electrical_loaded"] == "no" and d["evidence"] == []
+    # window title alone is not enough to claim it is loaded
+    app.Caption = "AutoCAD Electrical 2026 - [Drawing1.dwg]"
+    d = s.detect()
+    assert d["electrical_loaded"] == "unknown" and d["evidence"] == ["window title says AutoCAD Electrical"]
+
+
+def test_commands_exist_validates_names(sch):
+    s, _, app = sch
+    app.ActiveDocument.lisp_handler = lambda cmd: "yes" if "AEPROJECT" in cmd else "no"
+    assert s.commands_exist(["AEPROJECT", "NOPE"]) == {"AEPROJECT": "yes", "NOPE": "no"}
+    with pytest.raises(ValueError):
+        s.commands_exist(['X") (command "erase"'])
 
 
 def test_mode_switch_blocks_plan_tools_and_back(sch, monkeypatch):

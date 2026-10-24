@@ -1,20 +1,173 @@
 # Tool reference
 
-All 42 MCP tools, generated from the running server (`python scripts/gen_tool_docs.py`). Do not edit by hand.
+All 63 MCP tools, generated from the running server (`python scripts/gen_tool_docs.py`). Do not edit by hand.
 
 Floor tools take `project` and `floor` (letters, digits, `_`, `-`). Coordinates are in the drawing's units.
 
 | Group | Tools |
 | --- | --- |
+| Plan-first workflow | `plan_templates`, `plan_define`, `plan_show`, `plan_next`, `plan_approve`, `plan_update_step`, `plan_provide_input`, `plan_add_step`, `plan_add_input`, `plan_note` |
+| Excel inputs and calculations | `workbook_create`, `workbook_read`, `load_summary` |
 | Inspect | `register_reference`, `inspect_drawing`, `list_devices`, `list_floors`, `get_preview_image` |
 | Prepare | `prepare_floor_model`, `prepare_template` |
 | Plan | `plan_devices`, `propose_lighting_grid`, `set_circuit_assignment`, `plan_routes` |
 | Apply, undo, sync | `preview_changes`, `apply_changes`, `undo_last`, `sync_from_drawing` |
+| DIALux import and lighting schedule | `dialux_inspect`, `dialux_align`, `import_luminaire_list`, `dialux_import`, `lighting_schedule` |
 | Output | `generate_views`, `export_package`, `validate_drawing` |
-| Live editing (plan symbols) | `live_connect`, `live_selftest`, `live_scan`, `live_adopt`, `live_list_devices`, `live_texts`, `live_place`, `live_move`, `live_delete`, `live_assign`, `live_route`, `live_add_text`, `live_add_polyline`, `live_zoom`, `live_undo`, `live_save` |
+| Live editing (plan symbols) | `live_connect`, `live_selftest`, `live_scan`, `live_adopt`, `live_list_devices`, `live_texts`, `live_place`, `live_import_luminaires`, `live_move`, `live_delete`, `live_assign`, `live_route`, `live_add_text`, `live_add_polyline`, `live_zoom`, `live_undo`, `live_save` |
 | Mode switch | `live_set_mode` |
-| Schematic mode (AutoCAD Electrical) | `sch_detect`, `sch_read`, `sch_probe`, `sch_run_lisp` |
+| Schematic mode (AutoCAD Electrical) | `sch_detect`, `sch_check_commands`, `sch_modules`, `sch_read`, `sch_probe`, `sch_run_lisp` |
 | AutoCAD utilities (Windows) | `acad_status`, `acad_open`, `acad_run_command` |
+
+## Plan-first workflow
+
+Define a goal for large requests, track steps and the inputs needed from you. Guide: docs/planning.md.
+
+### `plan_templates`
+
+List the plan templates (lighting_from_dialux, load_and_max_demand, cable_and_protection, drawing_from_reference, sld_and_boq, full_project) with their steps, the inputs they need and which steps are not automated yet, and the Excel input workbooks available.
+
+_No parameters._
+
+### `plan_define`
+
+Start a plan for a large request BEFORE doing any work: a title, a one-paragraph goal, the success criteria ('done when...'), what is in and out of scope, and optionally a template that pre-fills the steps and the inputs needed from the user. The plan starts as a draft: show it to the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `title` | string | yes |  |
+| `goal` | string | yes |  |
+| `success_criteria` | list of string | yes |  |
+| `scope_in` | list of string | no | `None` |
+| `scope_out` | list of string | no | `None` |
+| `template` | string | no | `None` |
+| `replace` | boolean | no | `False` |
+
+### `plan_show`
+
+Current plan for a project: goal, approval, step statuses, inputs received/missing, what is ready now and exactly what is needed from the user, plus a markdown checklist to show them. Call this at the start of a session and after every step.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+
+### `plan_next`
+
+What to do next: steps that are ready, steps that are blocked (and by what), and the list of inputs the user must supply with how to supply them (including the Excel template to use). Ask the user for these in plain words.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+
+### `plan_approve`
+
+Record that the USER agreed to the goal and scope. Pass user_confirmed=true only after the user has actually said yes in this conversation; never on your own initiative.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `user_confirmed` | boolean | yes |  |
+| `note` | string | no | `None` |
+
+### `plan_update_step`
+
+Update a step. Finishing a step ('done') needs a result (files written, counts, key numbers, decisions) and is refused while its inputs are missing or earlier steps are unfinished, unless force=true with a note saying why. Call this as each step starts and finishes.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `step_id` | string | yes |  |
+| `status` | `pending` \| `in_progress` \| `done` \| `blocked` \| `skipped` | yes |  |
+| `note` | string | no | `None` |
+| `result` | string | no | `None` |
+| `force` | boolean | no | `False` |
+
+### `plan_provide_input`
+
+Record that the user supplied an input: reference = file path, value, or a short description of the decision; or not_applicable=true if it does not apply. Unblocks the steps that need it.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `input_id` | string | yes |  |
+| `reference` | string | no | `None` |
+| `note` | string | no | `None` |
+| `not_applicable` | boolean | no | `False` |
+
+### `plan_add_step`
+
+Add a step to the plan (e.g. when the scope grows). Say which inputs it needs and which steps must finish first.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `title` | string | yes |  |
+| `kind` | `input` \| `calc` \| `drawing` \| `review` \| `output` | yes |  |
+| `tools` | list of string | no | `None` |
+| `needs_inputs` | list of string | no | `None` |
+| `depends_on` | list of string | no | `None` |
+| `guidance` | string | no | `None` |
+
+### `plan_add_input`
+
+Add something the plan needs from the user: why it is needed and exactly how to provide it. workbook = name of an Excel template (see plan_templates) if it should be supplied that way.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `input_id` | string | yes |  |
+| `title` | string | yes |  |
+| `why` | string | yes |  |
+| `how` | string | yes |  |
+| `kind` | `file` \| `value` \| `table` \| `decision` \| `workbook` | no | `value` |
+| `workbook` | string | no | `None` |
+
+### `plan_note`
+
+Record an assumption, a decision or a note with its source (who/what it came from), so it is visible in the plan and in the report. Use it for every number or choice the user gave you.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `text` | string | yes |  |
+| `kind` | `assumption` \| `decision` \| `note` | no | `assumption` |
+| `source` | string | no | `None` |
+
+## Excel inputs and calculations
+
+Excel sheets for you to fill in, a validating reader, and the load summary.
+
+### `workbook_create`
+
+Create an Excel input sheet for the user to fill in (instructions sheet, 'Data' sheet with required columns marked *, dropdowns and visible formulas). Saved under <workspace>/<project>/inputs/. Tell the user the path and what to fill in; then call workbook_read once they have saved it. An existing file is never overwritten unless asked.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` | yes |  |
+| `overwrite` | boolean | no | `False` |
+
+### `workbook_read`
+
+Read and validate a filled-in sheet (default: the project's inputs/<kind>.xlsx): missing required fields, bad numbers, factors outside 0-1, unknown categories, duplicate ids. Returns the rows and a list of problems with row numbers to give the user. If plan_input_id is given and the sheet has no errors, that plan input is marked provided.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `kind` | `load_schedule` \| `lighting_requirements` \| `luminaire_list` \| `cable_protection_inputs` | yes |  |
+| `path` | string | no | `None` |
+| `plan_input_id` | string | no | `None` |
+
+### `load_summary`
+
+Connected load and maximum demand from the filled-in load schedule, by floor, board and category, plus the essential loads. Demand uses ONLY the demand factors the user entered: rows without one are listed and left out of the demand total (never assumed to be 1), and the result is marked incomplete. Refuses a sheet that has errors.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `path` | string | no | `None` |
+| `plan_input_id` | string | no | `None` |
 
 ## Inspect
 
@@ -191,6 +344,76 @@ Adopt manual edits: read device positions from an edited output DXF back into th
 | `view` | `lighting` \| `power` \| `combined` | no | `combined` |
 | `remove_missing` | boolean | no | `False` |
 
+## DIALux import and lighting schedule
+
+Bring a DIALux lighting layout into the floor model and total the lighting load. Guide: docs/dialux.md.
+
+### `dialux_inspect`
+
+Look inside a DIALux DWG/DXF export (read-only): block names with counts, layers, attributes, positions and units. Run this first, then choose which block names are luminaires for dialux_import. DWG needs the ODA File Converter on this machine; otherwise save/export it as DXF. Set include_nested=true if the luminaires sit inside one big block.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `path` | string | yes |  |
+| `include_nested` | boolean | no | `False` |
+
+### `dialux_align`
+
+Work out the transform (shift, rotation, scale) that maps the DIALux export onto the architectural drawing, from two points you can identify in both (e.g. two column corners): source_a/b in the DIALux file, target_a/b in the architectural drawing. Pass the result as `transform` to dialux_import. 'residual' is the leftover error at the second point (drawing units); a large value means the points do not match.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `source_a` | list of number | yes |  |
+| `source_b` | list of number | yes |  |
+| `target_a` | list of number | yes |  |
+| `target_b` | list of number | yes |  |
+
+### `import_luminaire_list`
+
+Read a luminaire list (CSV, or XLSX with openpyxl) exported from DIALux or Excel: type/name, quantity, wattage and luminous flux, with the columns detected automatically (override with columns={'type': 'Header', 'watts': 'Header', ...}). Read-only. Wattage is never invented: types without one are listed in missing_watts.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `path` | string | yes |  |
+| `sheet` | string | no | `None` |
+| `columns` | object | no | `None` |
+
+### `dialux_import`
+
+Import luminaires from a DIALux DWG/DXF export into the floor model as a CHANGESET (nothing is drawn until apply_changes). block_names/layers choose what to import (see dialux_inspect); dx/dy/rotation/scale or `transform` (from dialux_align) position it on the architectural drawing; type_map maps block names to device types (default luminaire; e.g. {'EXIT_SIGN': 'emergency'}); luminaire_list (CSV/XLSX path) and/or watts_by_type supply wattage and lumens; rooms are assigned from the model's room bounds. Re-importing updates in place, no duplicates; replace_previous=true also removes earlier DIALux devices that are no longer in the file.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+| `block_names` | list of string | no | `None` |
+| `layers` | list of string | no | `None` |
+| `include_nested` | boolean | no | `False` |
+| `dx` | number | no | `0.0` |
+| `dy` | number | no | `0.0` |
+| `rotation` | number | no | `0.0` |
+| `scale` | number | no | `1.0` |
+| `transform` | object | no | `None` |
+| `type_map` | object | no | `None` |
+| `luminaire_list` | string | no | `None` |
+| `watts_by_type` | object | no | `None` |
+| `circuit` | string | no | `None` |
+| `label_attribute` | string | no | `None` |
+| `replace_previous` | boolean | no | `False` |
+| `tolerance` | number | no | `0.01` |
+
+### `lighting_schedule`
+
+Lighting schedule for a floor from the model: luminaire counts by type per room, installed wattage per room and floor (and W/m2 when room area is known). Wattage comes from the device (e.g. imported from DIALux) or watts_by_type; luminaires without one are reported as missing, never guessed. unit_to_m = metres per drawing unit (0.001 for a millimetre drawing). This is installed load only: no demand factor, no lux calculation.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `project` | string | yes |  |
+| `floor` | string | yes |  |
+| `watts_by_type` | object | no | `None` |
+| `unit_to_m` | number | no | `None` |
+
 ## Output
 
 Generate the drawing views and the export package.
@@ -290,6 +513,28 @@ LIVE: draw a device symbol (reference style, correct layer) at x,y in the open d
 | `circuit` | string | no | `None` |
 | `db` | string | no | `None` |
 | `room` | string | no | `None` |
+
+### `live_import_luminaires`
+
+LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing, as one undo step. Same parameters as dialux_import. dry_run=true (default) only reports what would be drawn (counts per block, first positions); call again with dry_run=false to draw. Already placed luminaires at the same spot are skipped.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `floor` | string | yes |  |
+| `path` | string | yes |  |
+| `block_names` | list of string | no | `None` |
+| `layers` | list of string | no | `None` |
+| `include_nested` | boolean | no | `False` |
+| `dx` | number | no | `0.0` |
+| `dy` | number | no | `0.0` |
+| `rotation` | number | no | `0.0` |
+| `scale` | number | no | `1.0` |
+| `transform` | object | no | `None` |
+| `type_map` | object | no | `None` |
+| `luminaire_list` | string | no | `None` |
+| `watts_by_type` | object | no | `None` |
+| `circuit` | string | no | `None` |
+| `dry_run` | boolean | no | `True` |
 
 ### `live_move`
 
@@ -397,6 +642,20 @@ Read and probe only for now. Enabled with `live_set_mode('schematic')`.
 ### `sch_detect`
 
 SCHEMATIC: check the open drawing / AutoCAD Electrical: product and version, whether the Electrical commands are loaded, whether the AutoLISP bridge works, and how many components, wire numbers and wire lines the drawing has. Run this first in schematic mode.
+
+_No parameters._
+
+### `sch_check_commands`
+
+SCHEMATIC: ask AutoCAD whether each command name is registered (e.g. AEPROJECT). Unlike sch_probe this also sees commands provided by compiled Electrical modules. Read-only.
+
+| Parameter | Type | Required | Default |
+| --- | --- | --- | --- |
+| `names` | list of string | yes |  |
+
+### `sch_modules`
+
+SCHEMATIC: list the compiled modules (ARX) loaded in the open AutoCAD session; shows whether AutoCAD Electrical's own modules are active. Read-only.
 
 _No parameters._
 

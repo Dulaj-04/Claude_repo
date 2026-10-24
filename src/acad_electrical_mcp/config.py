@@ -24,6 +24,7 @@ class Config:
     workspace: Path
     backend: str = "dxf"  # "dxf" (offline, ezdxf) or "autocad" (live COM, Windows)
     allow_commands: bool = False
+    require_plan: bool = False
 
     @classmethod
     def from_env(cls) -> Config:
@@ -31,4 +32,5 @@ class Config:
             workspace=Path(os.environ.get("ACAD_MCP_WORKSPACE", "acad_mcp_workspace")).resolve(),
             backend=os.environ.get("ACAD_MCP_BACKEND", "dxf").lower(),
             allow_commands=os.environ.get("ACAD_MCP_ALLOW_COMMANDS", "") == "1",
+            require_plan=os.environ.get("ACAD_MCP_REQUIRE_PLAN", "") == "1",
         )

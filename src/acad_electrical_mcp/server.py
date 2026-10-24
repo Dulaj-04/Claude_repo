@@ -6,13 +6,15 @@ import argparse
 import json
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import __version__, export, inspection, planner, template, validate
+from . import __version__, dialux, export, inspection, planner, template, validate, workbook
+from . import plan as plans
 from .backends import autocad_backend
 from .backends.base import BackendError
 from .config import Config, safe_name
@@ -25,16 +27,35 @@ logging.getLogger("ezdxf").setLevel(logging.ERROR)  # quiet stderr (stdio transp
 
 CFG = Config.from_env()
 STORE = Store(CFG.workspace)
+PLANS = plans.PlanStore(CFG.workspace)
 
 INSTRUCTIONS = """\
-Tools to create, revise, validate and export editable electrical floor drawings
-(AutoCAD Electrical workflow). Everything is a DRAFT drawing aid, not engineering approval.
+Tools to plan, create, revise, validate and export electrical floor drawings and the inputs behind
+them (AutoCAD Electrical workflow). Everything is a DRAFT drawing/calculation aid, not engineering
+approval. Never invent ratings, factors or table values: ask the user, or record the gap.
 
-Typical flow: prepare_floor_model (register the architectural DXF/DWG + rooms) ->
-plan_devices / propose_lighting_grid / set_circuit_assignment / plan_routes (each returns a
-changeset) -> preview_changes -> apply_changes (regenerates the DXF views) ->
-validate_drawing -> export_package (DXF/DWG/PNG/PDF + manifest.json).
-Reference drawings are never modified; outputs go to the workspace output folder.
+WORK PLAN-FIRST (important)
+1. At the start of a conversation about a project, call plan_show(project). If a plan exists,
+   continue it; tell the user where it stands and what is next.
+2. If the request is LARGE (more than one tool call, several drawings/floors, calculations, or it
+   needs data from the user), do NOT start executing. First call plan_define with a clear goal,
+   success criteria and scope (use plan_templates to pick a template), show the plan to the user and
+   ask whether the goal is right. Call plan_approve only after they agree (user_confirmed=true).
+3. Work step by step: plan_next tells you what is ready and EXACTLY what is needed from the user
+   (files, Excel sheets, values, decisions). Ask for those inputs plainly, with the how-to from the
+   plan. Excel input sheets: workbook_create gives a template, the user fills it in, workbook_read
+   checks it, load_summary computes from it.
+4. Keep the plan current: plan_provide_input when the user supplies something, plan_update_step with
+   a result when a step finishes, plan_note for assumptions and decisions. End each reply with the
+   short progress line and what you need next from the user.
+5. Small, single-action requests (one placement, one inspection) need no plan.
+
+Offline drawing flow: prepare_floor_model -> plan_devices / propose_lighting_grid /
+set_circuit_assignment / plan_routes (each returns a changeset) -> preview_changes -> apply_changes ->
+validate_drawing -> export_package. Reference drawings are never modified.
+DIALux: dialux_inspect -> dialux_align -> import_luminaire_list -> dialux_import (changeset) ->
+apply_changes (or live_import_luminaires) -> lighting_schedule.
+Always pass explicit project and floor ids (letters, digits, '_' and '-' only).
 
 LIVE MODE (Windows, drawing open in AutoCAD / AutoCAD Electrical): when the user wants to work
 on the open drawing and see changes on screen, use the live_* tools instead: live_connect first,
@@ -42,11 +63,11 @@ then live_scan / live_adopt (give existing symbols ids), live_texts (room names 
 live_place / live_move / live_delete / live_assign / live_route, live_zoom to show the change,
 live_undo to revert one instruction. Each call edits the open drawing immediately; keep steps
 small and tell the user what changed. These draw plan-level geometry, not Electrical schematic
-components. SCHEMATIC MODE: only when the user asks to work with AutoCAD Electrical schematics, call
+components.
+SCHEMATIC MODE: only when the user asks to work with AutoCAD Electrical schematics, call
 live_set_mode('schematic'), then sch_detect / sch_read / sch_probe. Otherwise stay in plan mode.
 Check unit_scale_vs_mm from live_connect: reference drawings are in millimetres
 even when the header says metres.
-Always pass explicit project and floor ids (letters, digits, '_' and '-' only).
 """
 
 mcp = FastMCP("acad-electrical", instructions=INSTRUCTIONS)
@@ -212,6 +233,7 @@ def apply_changes(
     """Apply a changeset: guarded by model revision, reference hash and manual-edit detection;
     snapshots the previous revision (undo_last), regenerates all four DXF views and reads them
     back for validation."""
+    _gate("apply_changes")
     m = _model(project, floor)
     cs = STORE.load_changeset(project, floor, changeset_id)
     out_dir = STORE.output_dir(project, floor)
@@ -402,6 +424,344 @@ def acad_run_command(command: str) -> dict[str, Any]:
 
 
 
+
+# --------------------------------------------------------------------------- DIALux import
+def _transform(dx, dy, rotation, scale, transform):
+    return transform if transform else dialux.make_transform(dx, dy, rotation, scale)
+
+
+@mcp.tool()
+def dialux_inspect(path: str, include_nested: bool = False) -> dict[str, Any]:
+    """Look inside a DIALux DWG/DXF export (read-only): block names with counts, layers,
+    attributes, positions and units. Run this first, then choose which block names are luminaires
+    for dialux_import. DWG needs the ODA File Converter on this machine; otherwise save/export it as
+    DXF. Set include_nested=true if the luminaires sit inside one big block."""
+    return _guard(lambda: dialux.inspect(path, include_nested))
+
+
+@mcp.tool()
+def dialux_align(source_a: list[float], source_b: list[float], target_a: list[float],
+                 target_b: list[float]) -> dict[str, Any]:
+    """Work out the transform (shift, rotation, scale) that maps the DIALux export onto the
+    architectural drawing, from two points you can identify in both (e.g. two column corners):
+    source_a/b in the DIALux file, target_a/b in the architectural drawing. Pass the result as
+    `transform` to dialux_import. 'residual' is the leftover error at the second point (drawing
+    units); a large value means the points do not match."""
+    return _guard(lambda: dialux.fit_two_points(source_a, source_b, target_a, target_b))
+
+
+@mcp.tool()
+def import_luminaire_list(path: str, sheet: str | None = None,
+                          columns: dict[str, str] | None = None) -> dict[str, Any]:
+    """Read a luminaire list (CSV, or XLSX with openpyxl) exported from DIALux or Excel: type/name,
+    quantity, wattage and luminous flux, with the columns detected automatically (override with
+    columns={'type': 'Header', 'watts': 'Header', ...}). Read-only. Wattage is never invented: types
+    without one are listed in missing_watts."""
+    return _guard(lambda: dialux.read_luminaire_list(path, sheet, columns))
+
+
+@mcp.tool()
+def dialux_import(
+    project: str, floor: str, path: str, block_names: list[str] | None = None,
+    layers: list[str] | None = None, include_nested: bool = False,
+    dx: float = 0.0, dy: float = 0.0, rotation: float = 0.0, scale: float = 1.0,
+    transform: dict[str, float] | None = None, type_map: dict[str, str] | None = None,
+    luminaire_list: str | None = None, watts_by_type: dict[str, float] | None = None,
+    circuit: str | None = None, label_attribute: str | None = None,
+    replace_previous: bool = False, tolerance: float = 0.01,
+) -> dict[str, Any]:
+    """Import luminaires from a DIALux DWG/DXF export into the floor model as a CHANGESET (nothing
+    is drawn until apply_changes). block_names/layers choose what to import (see dialux_inspect);
+    dx/dy/rotation/scale or `transform` (from dialux_align) position it on the architectural
+    drawing; type_map maps block names to device types (default luminaire; e.g. {'EXIT_SIGN':
+    'emergency'}); luminaire_list (CSV/XLSX path) and/or watts_by_type supply wattage and lumens;
+    rooms are assigned from the model's room bounds. Re-importing updates in place, no duplicates;
+    replace_previous=true also removes earlier DIALux devices that are no longer in the file."""
+    m = _model(project, floor)
+
+    def run():
+        t = _transform(dx, dy, rotation, scale, transform)
+        found = dialux.extract(path, block_names, layers, include_nested, t)
+        if not found:
+            raise ValueError("No matching blocks found. Check block_names/layers with dialux_inspect.")
+        specs = dialux.specs_from_list(dialux.read_luminaire_list(luminaire_list)) \
+            if luminaire_list else {}
+        tag = f"dialux:{Path(path).name}:{dialux.sha256_file(path)[:8]}"
+        devs, info = dialux.build_device_specs(m, found, type_map, specs, watts_by_type, circuit,
+                                               tag, label_attribute)
+        remove = []
+        if replace_previous:
+            for d in m["devices"]:
+                if str(d.get("source", "")).startswith("dialux:") and not any(
+                        n["type"] == d["type"] and abs(n["x"] - d["x"]) <= tolerance
+                        and abs(n["y"] - d["y"]) <= tolerance for n in devs):
+                    remove.append(d["id"])
+        cs = planner.plan_devices(m, devs, remove, tolerance)
+        cs["label"] = "dialux_import"
+        chk = dialux.extent_check(m, devs)
+        info["extent_check"] = chk
+        if chk and chk["suspicious"]:
+            cs["assumptions"].append(
+                f"SCALE/UNITS LOOK WRONG: the imported luminaires span {chk['imported_span']} but "
+                f"the rooms span {chk['rooms_span']} (ratio {chk['ratio']}). Check the units "
+                "(DIALux exports metres) and use dialux_align or scale/dx/dy.")
+        if info["outside_all_rooms"]:
+            cs["assumptions"].append(
+                f"{info['outside_all_rooms']} imported luminaire(s) fall outside every room in the "
+                "model: check the alignment (dialux_align) or add the missing rooms.")
+        if info["types_without_watts"]:
+            cs["assumptions"].append(
+                f"No wattage for {info['types_without_watts']}: supply luminaire_list or "
+                "watts_by_type; the lighting schedule will show them as missing.")
+        cs["assumptions"].append(
+            f"Imported from {Path(path).name}; positions as exported by DIALux, transformed with "
+            f"{t}. Values are as supplied, not verified.")
+        STORE.save_changeset(cs)
+        return {**planner.describe(cs, m), "found_in_file": len(found),
+                "by_block": dict(Counter(f["block"] for f in found)), **info,
+                "transform": t, "removed_previous": remove}
+
+    return _guard(run)
+
+
+@mcp.tool()
+def lighting_schedule(project: str, floor: str, watts_by_type: dict[str, float] | None = None,
+                      unit_to_m: float | None = None) -> dict[str, Any]:
+    """Lighting schedule for a floor from the model: luminaire counts by type per room, installed
+    wattage per room and floor (and W/m2 when room area is known). Wattage comes from the device
+    (e.g. imported from DIALux) or watts_by_type; luminaires without one are reported as missing,
+    never guessed. unit_to_m = metres per drawing unit (0.001 for a millimetre drawing). This is
+    installed load only: no demand factor, no lux calculation."""
+    m = _model(project, floor)
+    return _guard(lambda: dialux.lighting_schedule(m, watts_by_type, unit_to_m))
+
+
+# --------------------------------------------------------------------------- plan-first workflow
+def _pl(project: str) -> dict[str, Any]:
+    try:
+        return PLANS.load(project)
+    except plans.PlanError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _plan_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except plans.PlanError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@mcp.tool()
+def plan_templates() -> dict[str, Any]:
+    """List the plan templates (lighting_from_dialux, load_and_max_demand, cable_and_protection,
+    drawing_from_reference, sld_and_boq, full_project) with their steps, the inputs they need and
+    which steps are not automated yet, and the Excel input workbooks available."""
+    return {"templates": plans.list_templates(), "workbooks": workbook.list_workbooks()}
+
+
+@mcp.tool()
+def plan_define(project: str, title: str, goal: str, success_criteria: list[str],
+                scope_in: list[str] | None = None, scope_out: list[str] | None = None,
+                template: str | None = None, replace: bool = False) -> dict[str, Any]:
+    """Start a plan for a large request BEFORE doing any work: a title, a one-paragraph goal, the
+    success criteria ('done when...'), what is in and out of scope, and optionally a template that
+    pre-fills the steps and the inputs needed from the user. The plan starts as a draft: show it to
+    the user and call plan_approve once they agree. Use replace=true to overwrite an existing plan."""
+    safe_name(project, "project")
+    if PLANS.exists(project) and not replace:
+        raise ValueError(f"A plan already exists for {project!r}. Call plan_show, or pass "
+                         "replace=true to start over.")
+    plan = _plan_call(plans.define, project, title, goal, success_criteria, scope_in, scope_out,
+                      template)
+    PLANS.save(plan)
+    PLANS.set_active(project)
+    out = plans.summary(plan)
+    out["tell_the_user"] = ("Show the goal, success criteria, steps and the inputs needed from the "
+                            "user, and ask: is this the right goal? Then call plan_approve.")
+    return out
+
+
+@mcp.tool()
+def plan_show(project: str) -> dict[str, Any]:
+    """Current plan for a project: goal, approval, step statuses, inputs received/missing, what is
+    ready now and exactly what is needed from the user, plus a markdown checklist to show them.
+    Call this at the start of a session and after every step."""
+    plan = _pl(project)
+    PLANS.set_active(project)
+    return plans.summary(plan)
+
+
+@mcp.tool()
+def plan_next(project: str) -> dict[str, Any]:
+    """What to do next: steps that are ready, steps that are blocked (and by what), and the list
+    of inputs the user must supply with how to supply them (including the Excel template to use).
+    Ask the user for these in plain words."""
+    plan = _pl(project)
+    return {**plans.next_actions(plan), "checklist": plans.render_markdown(plan)}
+
+
+@mcp.tool()
+def plan_approve(project: str, user_confirmed: bool, note: str | None = None) -> dict[str, Any]:
+    """Record that the USER agreed to the goal and scope. Pass user_confirmed=true only after the
+    user has actually said yes in this conversation; never on your own initiative."""
+    if not user_confirmed:
+        raise ValueError("Ask the user whether the goal and scope are right first; call this with "
+                         "user_confirmed=true only after they say yes.")
+    plan = _pl(project)
+    plan["goal"]["approved"], plan["goal"]["approval_note"] = True, note
+    plan["status"] = "approved" if plan["status"] == "draft" else plan["status"]
+    plans._log(plan, "Goal approved by the user" + (f": {note}" if note else ""))
+    PLANS.save(plan)
+    PLANS.set_active(project)
+    return plans.summary(plan)
+
+
+@mcp.tool()
+def plan_update_step(project: str, step_id: str, status: Literal[
+        "pending", "in_progress", "done", "blocked", "skipped"], note: str | None = None,
+        result: str | None = None, force: bool = False) -> dict[str, Any]:
+    """Update a step. Finishing a step ('done') needs a result (files written, counts, key numbers,
+    decisions) and is refused while its inputs are missing or earlier steps are unfinished, unless
+    force=true with a note saying why. Call this as each step starts and finishes."""
+    plan = _pl(project)
+    _plan_call(plans.update_step, plan, step_id, status, note, result, force)
+    PLANS.save(plan)
+    return plans.summary(plan)
+
+
+@mcp.tool()
+def plan_provide_input(project: str, input_id: str, reference: str | None = None,
+                       note: str | None = None, not_applicable: bool = False) -> dict[str, Any]:
+    """Record that the user supplied an input: reference = file path, value, or a short description
+    of the decision; or not_applicable=true if it does not apply. Unblocks the steps that need it."""
+    plan = _pl(project)
+    _plan_call(plans.provide_input, plan, input_id, reference, note, not_applicable)
+    PLANS.save(plan)
+    return {**plans.next_actions(plan), "checklist": plans.render_markdown(plan)}
+
+
+@mcp.tool()
+def plan_add_step(project: str, title: str, kind: Literal[
+        "input", "calc", "drawing", "review", "output"], tools: list[str] | None = None,
+        needs_inputs: list[str] | None = None, depends_on: list[str] | None = None,
+        guidance: str | None = None) -> dict[str, Any]:
+    """Add a step to the plan (e.g. when the scope grows). Say which inputs it needs and which
+    steps must finish first."""
+    plan = _pl(project)
+    s = _plan_call(plans.add_step, plan, title, kind, tools, needs_inputs, depends_on, guidance)
+    PLANS.save(plan)
+    return {"added": s, "checklist": plans.render_markdown(plan)}
+
+
+@mcp.tool()
+def plan_add_input(project: str, input_id: str, title: str, why: str, how: str,
+                   kind: Literal["file", "value", "table", "decision", "workbook"] = "value",
+                   workbook: str | None = None) -> dict[str, Any]:
+    """Add something the plan needs from the user: why it is needed and exactly how to provide it.
+    workbook = name of an Excel template (see plan_templates) if it should be supplied that way."""
+    plan = _pl(project)
+    i = _plan_call(plans.add_input, plan, input_id, title, why, kind, how, workbook)
+    PLANS.save(plan)
+    return {"added": i, "checklist": plans.render_markdown(plan)}
+
+
+@mcp.tool()
+def plan_note(project: str, text: str, kind: Literal["assumption", "decision", "note"] = "assumption",
+              source: str | None = None) -> dict[str, Any]:
+    """Record an assumption, a decision or a note with its source (who/what it came from), so it
+    is visible in the plan and in the report. Use it for every number or choice the user gave you."""
+    plan = _pl(project)
+    n = plans.note(plan, text, kind, source)
+    PLANS.save(plan)
+    return {"recorded": n, "count": len(plan["assumptions"])}
+
+
+# --------------------------------------------------------------------------- Excel inputs
+@mcp.tool()
+def workbook_create(project: str, kind: Literal[
+        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs"],
+        overwrite: bool = False) -> dict[str, Any]:
+    """Create an Excel input sheet for the user to fill in (instructions sheet, 'Data' sheet with
+    required columns marked *, dropdowns and visible formulas). Saved under
+    <workspace>/<project>/inputs/. Tell the user the path and what to fill in; then call
+    workbook_read once they have saved it. An existing file is never overwritten unless asked."""
+    return _guard(lambda: workbook.create(CFG.workspace, project, kind, overwrite))
+
+
+@mcp.tool()
+def workbook_read(project: str, kind: Literal[
+        "load_schedule", "lighting_requirements", "luminaire_list", "cable_protection_inputs"],
+        path: str | None = None, plan_input_id: str | None = None) -> dict[str, Any]:
+    """Read and validate a filled-in sheet (default: the project's inputs/<kind>.xlsx): missing
+    required fields, bad numbers, factors outside 0-1, unknown categories, duplicate ids. Returns
+    the rows and a list of problems with row numbers to give the user. If plan_input_id is given
+    and the sheet has no errors, that plan input is marked provided."""
+    p = path or str(workbook.inputs_dir(CFG.workspace, project) / f"{kind}.xlsx")
+    res = _guard(lambda: workbook.read(p, kind))
+    if plan_input_id and res["ok"] and PLANS.exists(project):
+        plan = PLANS.load(project)
+        _plan_call(plans.provide_input, plan, plan_input_id, p, f"{res['row_count']} rows, no errors",
+                   False)
+        PLANS.save(plan)
+        res["plan_input_marked_provided"] = plan_input_id
+    return res
+
+
+@mcp.tool()
+def load_summary(project: str, path: str | None = None, plan_input_id: str | None = None
+                 ) -> dict[str, Any]:
+    """Connected load and maximum demand from the filled-in load schedule, by floor, board and
+    category, plus the essential loads. Demand uses ONLY the demand factors the user entered: rows
+    without one are listed and left out of the demand total (never assumed to be 1), and the result
+    is marked incomplete. Refuses a sheet that has errors."""
+    p = path or str(workbook.inputs_dir(CFG.workspace, project) / "load_schedule.xlsx")
+    res = _guard(lambda: workbook.read(p, "load_schedule"))
+    if not res["ok"]:
+        raise ValueError(f"The load schedule has {res['errors']} error(s); fix them first "
+                         f"(workbook_read shows rows and columns): {res['issues'][:5]}")
+    out = workbook.load_summary(res["rows"])
+    out["source_file"] = res["path"]
+    out["rows_used"] = res["row_count"]
+    return out
+
+
+# --------------------------------------------------------------------------- prompts
+@mcp.prompt()
+def plan_a_request(project: str, request: str) -> str:
+    """Turn a request into a structured plan before doing any work."""
+    return (f"Project: {project}\nRequest: {request}\n\nWork plan-first with the acad-electrical "
+            "tools. 1) plan_show to see whether a plan already exists. 2) If this request is large, "
+            "pick a template with plan_templates, call plan_define with a clear goal, success "
+            "criteria and scope, show it to me and ask if the goal is right. 3) Only after I agree, "
+            "plan_approve. 4) Then use plan_next to tell me exactly what you need from me (files, "
+            "Excel sheets, values, decisions) and work step by step, keeping the plan updated.")
+
+
+@mcp.prompt()
+def lighting_from_dialux(project: str, floor: str) -> str:
+    """Plan and run a DIALux lighting import for one floor."""
+    return (f"Project {project}, floor {floor}: import our DIALux lighting layout. Use "
+            "plan_define with template 'lighting_from_dialux', show me the goal and the inputs you "
+            "need (architectural drawing, DIALux DWG/DXF export, luminaire list, alignment points), "
+            "wait for my approval, then follow plan_next step by step.")
+
+
+@mcp.prompt()
+def load_schedule_and_demand(project: str) -> str:
+    """Plan a load schedule and maximum demand calculation using Excel input sheets."""
+    return (f"Project {project}: build the load schedule and maximum demand. Use plan_define with "
+            "template 'load_and_max_demand', create the load_schedule workbook, tell me exactly how "
+            "to fill it in, check it with workbook_read, then run load_summary. Do not assume demand "
+            "factors: ask me for them and record their source with plan_note.")
+
+
+@mcp.prompt()
+def project_roadmap(project: str) -> str:
+    """Set up the whole electrical installation project as a roadmap of separate plans."""
+    return (f"Project {project}: set up the whole electrical installation work plan. Use plan_define "
+            "with template 'full_project' as the roadmap, tell me which parts are automated and "
+            "which are not yet, and propose which part to plan first.")
+
 # --------------------------------------------------------------------------- live editing
 _LIVE: LiveSession | None = None
 
@@ -425,7 +785,24 @@ def _guard(fn, *a, **kw):
         raise ValueError(f"AutoCAD call failed: {type(exc).__name__}: {exc}") from exc
 
 
-def _plan() -> LiveSession:
+def _gate(what: str) -> None:
+    """Strict mode (ACAD_MCP_REQUIRE_PLAN=1): drawing-changing tools need an approved plan goal."""
+    if not CFG.require_plan:
+        return
+    project = PLANS.active()
+    ok = False
+    if project and PLANS.exists(project):
+        ok = PLANS.load(project)["goal"]["approved"]
+    if not ok:
+        raise ValueError(
+            f"{what} is blocked: this server requires an approved plan before it changes drawings "
+            "(ACAD_MCP_REQUIRE_PLAN=1). Define the goal with plan_define, show it to the user and "
+            "call plan_approve after they agree.")
+
+
+def _plan(write: bool = True) -> LiveSession:
+    if write:
+        _gate("Changing the open drawing")
     live = _live()
     if live.mode != "plan":
         raise ValueError("Schematic mode is on, so plan-level drawing tools are disabled. Use the "
@@ -466,6 +843,21 @@ def sch_probe(prefix: str = "c:ae", limit: int = 400) -> dict[str, Any]:
     name starts with prefix (try c:ae, c:wd, c:ace, wd_, ace_). Read-only; used to learn the real
     command names before insert/wire tools are built."""
     return _guard(lambda: Schematic(_live()).probe(prefix, limit))
+
+
+@mcp.tool()
+def sch_check_commands(names: list[str]) -> dict[str, Any]:
+    """SCHEMATIC: ask AutoCAD whether each command name is registered (e.g. AEPROJECT). Unlike
+    sch_probe this also sees commands provided by compiled Electrical modules. Read-only."""
+    return {"registered": _guard(lambda: Schematic(_live()).commands_exist(names))}
+
+
+@mcp.tool()
+def sch_modules() -> dict[str, Any]:
+    """SCHEMATIC: list the compiled modules (ARX) loaded in the open AutoCAD session; shows
+    whether AutoCAD Electrical's own modules are active. Read-only."""
+    mods = _guard(lambda: Schematic(_live()).arx_modules())
+    return {"count": len(mods), "modules": mods}
 
 
 @mcp.tool()
@@ -538,6 +930,46 @@ def live_place(
     Same type at the same spot is not duplicated. One undo step."""
     safe_name(floor, "floor")
     return _guard(lambda: _plan().place(floor, type, x, y, rotation, circuit, db, room))
+
+
+@mcp.tool()
+def live_import_luminaires(
+    floor: str, path: str, block_names: list[str] | None = None, layers: list[str] | None = None,
+    include_nested: bool = False, dx: float = 0.0, dy: float = 0.0, rotation: float = 0.0,
+    scale: float = 1.0, transform: dict[str, float] | None = None,
+    type_map: dict[str, str] | None = None, luminaire_list: str | None = None,
+    watts_by_type: dict[str, float] | None = None, circuit: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """LIVE: draw luminaires from a DIALux DWG/DXF export into the OPEN AutoCAD drawing, as one
+    undo step. Same parameters as dialux_import. dry_run=true (default) only reports what would be
+    drawn (counts per block, first positions); call again with dry_run=false to draw. Already placed
+    luminaires at the same spot are skipped."""
+    safe_name(floor, "floor")
+
+    def run():
+        live = _plan(write=not dry_run)
+        t = _transform(dx, dy, rotation, scale, transform)
+        found = dialux.extract(path, block_names, layers, include_nested, t)
+        if not found:
+            raise ValueError("No matching blocks found. Check block_names/layers with dialux_inspect.")
+        specs = dialux.specs_from_list(dialux.read_luminaire_list(luminaire_list)) \
+            if luminaire_list else {}
+        tag = f"dialux:{Path(path).name}:{dialux.sha256_file(path)[:8]}"
+        devs, info = dialux.build_device_specs({"rooms": []}, found, type_map, specs,
+                                               watts_by_type, circuit, tag)
+        report = {"found_in_file": len(found), "by_block": dict(Counter(f["block"] for f in found)),
+                  "types_without_watts": info["types_without_watts"], "transform": t,
+                  "first_positions": [[d["x"], d["y"]] for d in devs[:10]]}
+        if dry_run:
+            return {"dry_run": True, **report, "next": "call again with dry_run=false to draw"}
+        items = [{"type": d["type"], "x": d["x"], "y": d["y"], "rotation": d["rotation"],
+                  "circuit": d["circuit"],
+                  "extra": {k: d[k] for k in ("luminaire_type", "watts", "lumens", "source")
+                            if d.get(k) is not None}} for d in devs]
+        return {"dry_run": False, **report, **live.place_many(floor, items)}
+
+    return _guard(run)
 
 
 @mcp.tool()

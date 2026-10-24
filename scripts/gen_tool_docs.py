@@ -17,6 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs" / "tools.md"
 
 GROUPS: list[tuple[str, str, list[str]]] = [
+    ("Plan-first workflow",
+     "Define a goal for large requests, track steps and the inputs needed from you. Guide: "
+     "docs/planning.md.",
+     ["plan_templates", "plan_define", "plan_show", "plan_next", "plan_approve", "plan_update_step",
+      "plan_provide_input", "plan_add_step", "plan_add_input", "plan_note"]),
+    ("Excel inputs and calculations",
+     "Excel sheets for you to fill in, a validating reader, and the load summary.",
+     ["workbook_create", "workbook_read", "load_summary"]),
     ("Inspect", "Read drawings and models. Nothing is changed.",
      ["register_reference", "inspect_drawing", "list_devices", "list_floors", "get_preview_image"]),
     ("Prepare", "Create the floor model and set the drawing template.",
@@ -26,18 +34,23 @@ GROUPS: list[tuple[str, str, list[str]]] = [
      ["plan_devices", "propose_lighting_grid", "set_circuit_assignment", "plan_routes"]),
     ("Apply, undo, sync", "Guarded writes with undo and read-back.",
      ["preview_changes", "apply_changes", "undo_last", "sync_from_drawing"]),
+    ("DIALux import and lighting schedule",
+     "Bring a DIALux lighting layout into the floor model and total the lighting load. "
+     "Guide: docs/dialux.md.",
+     ["dialux_inspect", "dialux_align", "import_luminaire_list", "dialux_import",
+      "lighting_schedule"]),
     ("Output", "Generate the drawing views and the export package.",
      ["generate_views", "export_package", "validate_drawing"]),
     ("Live editing (plan symbols)",
      "Windows + AutoCAD / AutoCAD Electrical running. These edit the **open drawing directly**.",
      ["live_connect", "live_selftest", "live_scan", "live_adopt", "live_list_devices", "live_texts",
-      "live_place", "live_move", "live_delete", "live_assign", "live_route", "live_add_text",
+      "live_place", "live_import_luminaires", "live_move", "live_delete", "live_assign", "live_route", "live_add_text",
       "live_add_polyline", "live_zoom", "live_undo", "live_save"]),
     ("Mode switch", "Choose between plan-symbol tools and AutoCAD Electrical schematic tools.",
      ["live_set_mode"]),
     ("Schematic mode (AutoCAD Electrical)",
      "Read and probe only for now. Enabled with `live_set_mode('schematic')`.",
-     ["sch_detect", "sch_read", "sch_probe", "sch_run_lisp"]),
+     ["sch_detect", "sch_check_commands", "sch_modules", "sch_read", "sch_probe", "sch_run_lisp"]),
     ("AutoCAD utilities (Windows)", "Direct AutoCAD COM helpers.",
      ["acad_status", "acad_open", "acad_run_command"]),
 ]

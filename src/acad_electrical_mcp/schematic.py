@@ -12,6 +12,7 @@ round trip, chunked), because SendCommand itself returns nothing.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -138,6 +139,21 @@ class Schematic:
                         "wire network itself lives in AutoCAD Electrical's data."}
 
     # ------------------------------------------------------------------ probing
+    def arx_modules(self) -> list[str]:
+        """Compiled modules (ARX) loaded in this session. AutoCAD Electrical registers its
+        commands through its own modules, which AutoLISP symbol checks cannot see."""
+        raw = self.lisp('(apply (quote strcat) (mapcar (quote (lambda (s) (strcat s ","))) (arx)))')
+        return [m for m in raw.split(",") if m and m.lower() != "nil"]
+
+    def commands_exist(self, names: list[str]) -> dict[str, str]:
+        """Ask AutoCAD whether each command name is registered (works for ARX/.NET commands)."""
+        out: dict[str, str] = {}
+        for n in names:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", n or ""):
+                raise ValueError(f"Invalid command name {n!r}: letters, digits, '_', '-', '.' only")
+            out[n] = "yes" if self.lisp(f'(if (getcname "{n}") "yes" "no")') == "yes" else "no"
+        return out
+
     def detect(self) -> dict[str, Any]:
         app = self.live.app
         c = self.live.com.call
@@ -146,13 +162,40 @@ class Schematic:
         try:
             info["product"] = self.lisp('(getvar "PRODUCT")')
             info["acadver"] = self.lisp('(getvar "ACADVER")')
-            info["electrical_command_aeproject"] = self.lisp(
-                '(if (boundp (quote c:aeproject)) "defined" "not defined")')
-            info["electrical_loaded"] = self.lisp(
-                '(if (or (boundp (quote c:aeproject)) (boundp (quote c:wd_proj))) "yes" "no")')
             info["lisp_bridge"] = "ok"
         except BackendError as exc:
             info["lisp_bridge"] = f"failed: {exc}"
+        evidence: list[str] = []
+        negative = 0
+        if info["lisp_bridge"] == "ok":
+            try:
+                mods = self.arx_modules()
+                info["arx_modules"] = mods
+                hits = [m for m in mods if re.search(r"acade|ace_|wd_|electrical", m, re.I)]
+                if hits:
+                    evidence.append(f"Electrical module(s) loaded: {', '.join(hits)}")
+                else:
+                    negative += 1
+            except BackendError as exc:
+                info["arx_modules"] = f"failed: {exc}"
+            try:
+                cmds = self.commands_exist(["AEPROJECT"])
+                info["registered_commands"] = cmds
+                if cmds["AEPROJECT"] == "yes":
+                    evidence.append("AEPROJECT is a registered command")
+                else:
+                    negative += 1
+            except BackendError as exc:
+                info["registered_commands"] = f"failed: {exc}"
+        if re.search(r"electrical", info["caption"], re.I):
+            evidence.append("window title says AutoCAD Electrical")
+        info["electrical_loaded"] = ("yes" if any("module" in e or "command" in e for e in evidence)
+                                     else ("unknown" if evidence else ("no" if negative else "unknown")))
+        info["evidence"] = evidence
+        info["note"] = ("PRODUCT reports plain 'AutoCAD' in vertical products, so it is not used "
+                        "as evidence. 'unknown' with only the window title means the module list "
+                        "and command check found nothing: use sch_check_commands with names you "
+                        "know from the Electrical ribbon or help.")
         summary = self.read(include_wires=True, limit=0)
         info.update(components=summary["components_total"],
                     wire_numbers=summary["wire_numbers_total"],

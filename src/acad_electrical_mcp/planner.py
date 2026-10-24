@@ -11,6 +11,8 @@ from .model import sha256_obj
 
 KIND_OF = {t: v[2] for t, v in DEVICE_TYPES.items() if v[2]}
 KIND_OF["data"] = "power"
+# optional per-device data carried through from imports (e.g. DIALux); never invented
+EXTRA_FIELDS = ("watts", "lumens", "luminaire_type", "source", "dialux_label")
 
 
 class Conflict(RuntimeError):
@@ -68,6 +70,8 @@ def plan_devices(
             "room": spec.get("room"), "circuit": spec.get("circuit"),
             "db": spec.get("db"), "note": spec.get("note"),
         }
+        extras = {k: spec[k] for k in EXTRA_FIELDS if spec.get(k) is not None}
+        cand.update(extras)
         if did and did in existing:
             cur = existing[did]
             if cur["type"] != dtype:
@@ -85,7 +89,14 @@ def plan_devices(
                         and abs(d["x"] - x) <= tolerance and abs(d["y"] - y) <= tolerance), None)
             dup_p = next((p for p in pending_positions if p[0] == dtype
                           and abs(p[1] - x) <= tolerance and abs(p[2] - y) <= tolerance), None)
-            if dup or dup_p:
+            if dup:
+                changes = {k: v for k, v in extras.items() if dup.get(k) != v}
+                if changes:
+                    ops.append({"op": "update_device", "id": dup["id"], "changes": changes})
+                else:
+                    unchanged += 1
+                continue
+            if dup_p:
                 unchanged += 1
                 continue
             did = next_device_id(model["floor"], dtype, taken)

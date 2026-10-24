@@ -118,6 +118,7 @@ class LiveSession:
         self.com = com
         self.state_dir = state_dir
         self.mode = "plan"  # "plan" = plan-level symbols, "schematic" = AutoCAD Electrical schematic
+        self._depth = 0  # nesting of _op(): only the outermost opens/closes the undo mark
 
     # ------------------------------------------------------------------ plumbing
     @property
@@ -158,11 +159,15 @@ class LiveSession:
 
         def __enter__(self):
             self.doc = self.live.doc
-            self.live.com.call(lambda: self.doc.StartUndoMark())
+            if self.live._depth == 0:
+                self.live.com.call(lambda: self.doc.StartUndoMark())
+            self.live._depth += 1
             return self
 
         def __exit__(self, *exc):
-            self.live.com.call(lambda: self.doc.EndUndoMark())
+            self.live._depth -= 1
+            if self.live._depth == 0:
+                self.live.com.call(lambda: self.doc.EndUndoMark())
             return False
 
     def _op(self) -> LiveSession._Op:
@@ -328,9 +333,13 @@ class LiveSession:
                 continue
             x, y = self._centre(g)
             moved = abs(x - meta["x"]) > 1e-3 or abs(y - meta["y"]) > 1e-3
-            devices.append({"id": did, "type": meta["type"], "x": round(x, 2), "y": round(y, 2),
-                            "circuit": meta.get("circuit"), "db": meta.get("db"),
-                            "room": meta.get("room"), "moved_by_hand": moved})
+            row = {"id": did, "type": meta["type"], "x": round(x, 2), "y": round(y, 2),
+                   "circuit": meta.get("circuit"), "db": meta.get("db"),
+                   "room": meta.get("room"), "moved_by_hand": moved}
+            for k in ("luminaire_type", "watts", "lumens", "source"):
+                if meta.get(k) is not None:
+                    row[k] = meta[k]
+            devices.append(row)
         routes = []
         for cid, r in sorted(data["routes"].items()):
             routes.append({**r, "present": cid.upper() in groups or ("R-" + cid).upper() in groups})
@@ -379,17 +388,25 @@ class LiveSession:
 
     def place(self, floor: str, dtype: str, x: float, y: float, rotation: float = 0.0,
               circuit: str | None = None, db: str | None = None, room: str | None = None,
-              device_id: str | None = None, tolerance: float | None = None) -> dict[str, Any]:
+              device_id: str | None = None, tolerance: float | None = None,
+              extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = self._load()
+        res = self._place_core(floor, dtype, x, y, rotation, circuit, db, room, device_id,
+                               tolerance, extra, data, self._groups(), self._scale(), {})
+        self._save(data)
+        return res
+
+    def _place_core(self, floor, dtype, x, y, rotation, circuit, db, room, device_id, tolerance,
+                    extra, data, groups, scale, centres) -> dict[str, Any]:
         if dtype not in SIZES_MM:
             raise ValueError(f"Unknown device type {dtype!r}; expected {sorted(SIZES_MM)}")
         x, y, rotation = _num(x, "x"), _num(y, "y"), _num(rotation, "rotation")
-        data = self._load()
-        groups = self._groups()
-        scale = self._scale()
         tol = tolerance if tolerance is not None else 10 * scale
         for did, meta in data["devices"].items():  # idempotent: same type at same spot = same
             if meta["type"] == dtype and did.upper() in groups:
-                gx, gy = self._centre(groups[did.upper()])
+                if did not in centres:
+                    centres[did] = self._centre(groups[did.upper()])
+                gx, gy = centres[did]
                 if abs(gx - x) <= tol and abs(gy - y) <= tol:
                     return {"id": did, "created": False, "note": "already placed here"}
         did = device_id or self._new_id(floor, dtype, data)
@@ -399,10 +416,36 @@ class LiveSession:
             ents = self._draw_symbol(dtype, x, y, rotation, scale)
             self._make_group(did, ents)
         data["devices"][did] = {"type": dtype, "x": x, "y": y, "rotation": rotation,
-                                "circuit": circuit, "db": db, "room": room}
-        self._save(data)
+                                "circuit": circuit, "db": db, "room": room, **(extra or {})}
+        centres[did] = (x, y)
+        groups[did.upper()] = True  # marks it present for the rest of a batch
         return {"id": did, "created": True, "type": dtype, "x": x, "y": y,
                 "layer": DEVICE_TYPES[dtype][1]}
+
+    def place_many(self, floor: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """Place many devices as ONE undo step. Items: {type,x,y,rotation?,circuit?,db?,room?,
+        extra?}. Same-type devices already at a spot are skipped."""
+        data = self._load()
+        groups = self._groups()
+        scale = self._scale()
+        centres: dict[str, tuple[float, float]] = {}
+        created, skipped, ids = 0, 0, []
+        try:
+            with self._op():
+                for it in items:
+                    r = self._place_core(floor, it["type"], it["x"], it["y"],
+                                         it.get("rotation", 0.0), it.get("circuit"), it.get("db"),
+                                         it.get("room"), None, None, it.get("extra"), data,
+                                         groups, scale, centres)
+                    if r["created"]:
+                        created += 1
+                        ids.append(r["id"])
+                    else:
+                        skipped += 1
+        finally:
+            self._save(data)  # keep the registry in step with whatever was drawn
+        return {"created": created, "already_present": skipped, "ids": ids[:200],
+                "undo": "one live_undo reverts the whole import"}
 
     def _device(self, device_id: str) -> tuple[dict[str, Any], dict[str, Any], Any]:
         data = self._load()
